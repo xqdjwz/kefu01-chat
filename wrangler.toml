@@ -1,0 +1,31 @@
+name = "cf-kefu-chat"
+main = "src/index.js"
+compatibility_date = "2025-04-01"
+workers_dev = true
+
+# 静态页面（访客端 index.html、客服端 agent.html、样式与聊天核心）
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# 【唯一必须手填的地方】把 database_id 换成你在 Cloudflare 后台新建的 D1 数据库 ID
+[[d1_databases]]
+binding = "DB"
+database_name = "cf_kefu"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# 可选：如果以后想用 R2 存图片，取消下面三行注释即可（代码会自动优先用 R2）
+# [[r2_buckets]]
+# binding = "BUCKET"
+# bucket_name = "cf-kefu-files"
+
+[vars]
+SHOP_NAME = "在线客服"
+AGENT_NAME = "客服"
+WELCOME_MESSAGE = "您好！欢迎光临，请问有什么可以帮您？"
+MAX_IMAGE_MB = "5"
+RECALL_WINDOW_SEC = "120"
+
+[observability]
+enabled = true
