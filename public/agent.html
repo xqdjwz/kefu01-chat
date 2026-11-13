@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>客服工作台</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body class="page-agent">
+
+  <!-- ===== 登录 ===== -->
+  <div class="login-wrap" id="login-view">
+    <div class="login-card">
+      <div class="mark-lg" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 11.5a8.4 8.4 0 01-9 8.4 9 9 0 01-3.8-.9L3 20l1.1-3.3A8.4 8.4 0 0112 3.1a8.4 8.4 0 019 8.4z"/>
+        </svg>
+      </div>
+      <h1>客服工作台</h1>
+      <p class="lead" id="login-lead">输入你的客服名称和口令进入。<br>第一次登录时，你输入的口令会自动成为系统口令。</p>
+      <form id="login-form" autocomplete="on">
+        <label class="field-label" for="name-input">客服名称</label>
+        <input class="field-input" id="name-input" name="name" type="text" maxlength="16" placeholder="例如：小旗" autocomplete="nickname">
+        <label class="field-label" for="token-input" style="margin-top:12px">客服口令</label>
+        <input class="field-input" id="token-input" name="passcode" type="password" autocomplete="current-password" placeholder="首次输入即为初始口令（至少 4 位）">
+        <button class="btn-primary" id="login-btn" type="submit">进入工作台</button>
+      </form>
+      <div class="login-error" id="login-error"></div>
+    </div>
+  </div>
+
+  <!-- ===== 工作台 ===== -->
+  <div class="agent-app" id="app-view" hidden>
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <div class="mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 11.5a8.4 8.4 0 01-9 8.4 9 9 0 01-3.8-.9L3 20l1.1-3.3A8.4 8.4 0 0112 3.1a8.4 8.4 0 019 8.4z"/>
+          </svg>
+        </div>
+        <div class="sidebar-head-titles">
+          <div class="sidebar-head-title" id="sidebar-title">客服工作台</div>
+          <div class="sidebar-head-sub"><span id="agent-name-label">客服</span> · <span id="conv-count">0</span> 个会话</div>
+        </div>
+      </div>
+
+      <div class="sidebar-tools">
+        <div class="search-box">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/>
+          </svg>
+          <input id="search-input" type="search" placeholder="搜索访客、备注或消息" aria-label="搜索会话">
+        </div>
+      </div>
+
+      <div class="conv-list" id="conv-list"></div>
+
+      <div class="sidebar-foot">
+        <a class="text-link" href="/" target="_blank" rel="noopener">访客端</a>
+        <button class="text-link" id="open-settings" type="button">设置</button>
+        <button class="text-link" id="logout" type="button">退出登录</button>
+      </div>
+    </aside>
+
+    <main class="agent-pane">
+      <header class="agent-pane-head" id="pane-head">
+        <button class="back-btn" id="back-btn" type="button" aria-label="返回会话列表">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>
+        </button>
+        <div class="pane-titles">
+          <div class="pane-name" id="pane-name">未选择会话</div>
+          <div class="pane-sub" id="pane-sub">从左侧选择一个访客会话</div>
+        </div>
+        <button class="rename-btn" id="btn-remark" type="button" title="备注该顾客" aria-label="备注该顾客" hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+        </button>
+      </header>
+
+      <div class="pane-empty" id="pane-empty">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 11.5a8.4 8.4 0 01-9 8.4 9 9 0 01-3.8-.9L3 20l1.1-3.3A8.4 8.4 0 0112 3.1a8.4 8.4 0 019 8.4z"/>
+        </svg>
+        <p>选择左侧会话开始回复<br>支持文字、表情、图片、撤回与已读回执</p>
+      </div>
+
+      <div id="agent-chat-host" class="chat-host" hidden></div>
+    </main>
+  </div>
+
+  <!-- ===== 备注弹窗 ===== -->
+  <div class="modal-mask" id="remark-mask" hidden>
+    <div class="modal modal-sm">
+      <div class="modal-head">
+        <h2>备注顾客</h2>
+        <button class="modal-close" type="button" data-close="remark">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-tip">备注只对自己的工作台可见，方便区分顾客，不会影响访客端显示。</p>
+        <input class="field-input" id="remark-input" maxlength="24" placeholder="例如：咨询纸箱价格-张先生">
+      </div>
+      <div class="modal-foot">
+        <button class="btn-ghost" id="remark-clear" type="button">清除备注</button>
+        <span style="flex:1"></span>
+        <button class="btn-ghost" type="button" data-close="remark">取消</button>
+        <button class="btn-primary modal-save" id="remark-save" type="button">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 设置弹窗 ===== -->
+  <div class="modal-mask" id="settings-mask" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <h2>工作台设置</h2>
+        <button class="modal-close" type="button" data-close="settings">✕</button>
+      </div>
+      <div class="modal-body">
+        <label class="field-label" for="set-shop">店铺名称（访客端顶部显示）</label>
+        <input class="field-input" id="set-shop" maxlength="24" placeholder="在线客服">
+
+        <label class="field-label" for="set-agent" style="margin-top:14px">我的客服名称（消息里显示）</label>
+        <input class="field-input" id="set-agent" maxlength="16" placeholder="例如：小旗">
+
+        <div class="avatar-row">
+          <div class="avatar-preview" id="avatar-preview"><span id="avatar-preview-text">客</span></div>
+          <div class="avatar-actions">
+            <button class="btn-ghost" type="button" id="avatar-pick">选择图片</button>
+            <button class="btn-ghost" type="button" id="avatar-clear" hidden>清除头像</button>
+            <div class="avatar-hint">建议正方形图片，消息左侧的客服头像会使用它</div>
+          </div>
+          <input type="file" id="avatar-file" accept="image/jpeg,image/png,image/gif,image/webp" hidden>
+        </div>
+
+        <div class="switch-row" style="margin-top:16px">
+          <div>
+            <div class="switch-title">自动欢迎语</div>
+            <div class="switch-desc">新访客第一次进入时，自动发送一条欢迎消息</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="set-welcome-enabled">
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+          </label>
+        </div>
+
+        <label class="field-label" for="set-welcome">欢迎语内容</label>
+        <textarea class="field-input field-textarea" id="set-welcome" rows="3" maxlength="500" placeholder="您好！欢迎光临，请问有什么可以帮您？"></textarea>
+
+        <label class="field-label" for="set-welcome-from">欢迎语署名</label>
+        <input class="field-input" id="set-welcome-from" maxlength="16" placeholder="客服">
+
+        <label class="field-label" for="set-passcode" style="margin-top:14px">修改口令（留空表示不改）</label>
+        <input class="field-input" id="set-passcode" type="password" placeholder="至少 4 位" autocomplete="new-password">
+
+        <div class="usage-block">
+          <div class="usage-head">
+            <span>存储用量</span>
+            <button class="text-link" id="usage-refresh" type="button">刷新</button>
+          </div>
+          <div class="usage-bar"><span id="usage-fill"></span></div>
+          <div class="usage-line" id="usage-line">读取中…</div>
+          <div class="usage-sub" id="usage-sub"></div>
+          <div class="usage-sub" id="usage-est"></div>
+
+          <label class="field-label" for="set-clean-days" style="margin-top:12px">自动清理：只保留最近多少天（0 = 关闭）</label>
+          <div class="usage-row">
+            <input class="field-input" id="set-clean-days" type="number" min="0" max="3650" step="1" placeholder="0">
+            <button class="btn-ghost" id="usage-clean-now" type="button">立即清理</button>
+          </div>
+          <div class="usage-note">自动清理会删掉早于设定天数的消息、没有消息再引用的图片，以及清空后的会话；保留的设置和口令不受影响。天数为 0 时不自动清理。</div>
+        </div>
+
+        <div class="login-error" id="settings-error"></div>
+      </div>
+      <div class="modal-foot">
+        <span style="flex:1"></span>
+        <button class="btn-ghost" type="button" data-close="settings">取消</button>
+        <button class="btn-primary modal-save" id="settings-save" type="button">保存设置</button>
+      </div>
+    </div>
+  </div>
+
+<script type="module">
+import { createChatHost, toast } from '/assets/chat.js';
+
+const TOKEN_KEY = 'kefu_agent_token';
+const NAME_KEY = 'kefu_agent_name';
+
+const loginView = document.getElementById('login-view');
+const appView = document.getElementById('app-view');
+const nameInput = document.getElementById('name-input');
+const tokenInput = document.getElementById('token-input');
+const loginBtn = document.getElementById('login-btn');
+const loginError = document.getElementById('login-error');
+const convList = document.getElementById('conv-list');
+const chatHost = document.getElementById('agent-chat-host');
+const paneEmpty = document.getElementById('pane-empty');
+const paneName = document.getElementById('pane-name');
+const paneSub = document.getElementById('pane-sub');
+const searchInput = document.getElementById('search-input');
+const remarkBtn = document.getElementById('btn-remark');
+
+let agentToken = '';
+let agentName = '客服';
+let agentAvatarUrl = '';
+let conversations = [];
+let activeId = null;
+let chat = null;
+let listTimer = null;
+let settingsCache = null;
+
+function fmtListTime(ts) {
+  const d = new Date(ts);
+  const t = new Date();
+  if (d.toDateString() === t.toDateString()) {
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  }
+  return `${d.getMonth() + 1}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function headers(json = false) {
+  return json
+    ? { authorization: `Bearer ${agentToken}`, 'content-type': 'application/json' }
+    : { authorization: `Bearer ${agentToken}` };
+}
+
+async function api(path, init = {}) {
+  const isForm = typeof FormData !== 'undefined' && init.body instanceof FormData;
+  const res = await fetch(path, { ...init, headers: headers(!isForm && !!init.body) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.message || `请求失败（${res.status}）`);
+  return data;
+}
+
+/* ------------------------------ 登录 ------------------------------ */
+
+async function login(passcode, name) {
+  loginBtn.disabled = true;
+  loginError.style.display = 'none';
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ passcode, name }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.message || '登录失败');
+
+    agentToken = data.token;
+    agentName = data.name || name || '客服';
+    localStorage.setItem(TOKEN_KEY, agentToken);
+    localStorage.setItem(NAME_KEY, agentName);
+    if (data.firstTime) toast('已把本次口令设为系统口令，可在设置里修改');
+    enterApp(data);
+  } catch (e) {
+    loginError.textContent = e.message;
+    loginError.style.display = 'block';
+    localStorage.removeItem(TOKEN_KEY);
+  } finally {
+    loginBtn.disabled = false;
+  }
+}
+
+document.getElementById('login-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const passcode = tokenInput.value.trim();
+  const name = nameInput.value.trim();
+  if (passcode.length < 4) {
+    loginError.textContent = '口令至少 4 位';
+    loginError.style.display = 'block';
+    return;
+  }
+  login(passcode, name);
+});
+
+/* ------------------------------ 进入工作台 ------------------------------ */
+
+function enterApp(loginData = {}) {
+  loginView.hidden = true;
+  appView.hidden = false;
+
+  document.getElementById('agent-name-label').textContent = agentName;
+  document.getElementById('sidebar-title').textContent = loginData.shopName
+    ? loginData.shopName
+    : '客服工作台';
+
+  chat = createChatHost({
+    root: chatHost,
+    role: 'agent',
+    token: agentToken,
+    convId: null,
+    recallWindow: 120,
+    emptyText: '从左侧选择一个会话',
+    selfName: agentName,
+    selfAvatarUrl: agentAvatarUrl,
+    onMeta: (conv) => {
+      const item = conversations.find((c) => c.id === conv.id);
+      if (item && item.unread !== conv.unread) {
+        item.unread = conv.unread;
+        renderList();
+      }
+    },
+    onChange: () => {
+      // 自己的消息或状态变化后，刷新列表预览
+      setTimeout(loadConversations, 400);
+    },
+  });
+
+  loadConversations();
+  clearInterval(listTimer);
+  listTimer = setInterval(loadConversations, 5000);
+}
+
+/* ------------------------------ 会话列表 ------------------------------ */
+
+async function loadConversations() {
+  try {
+    const data = await api('/api/conversations');
+    conversations = data.conversations || [];
+    document.getElementById('conv-count').textContent = String(conversations.length);
+
+    // 首次进入（桌面端）自动选中最新会话
+    if (!activeId && conversations.length && window.innerWidth > 760) {
+      openConversation(conversations[0]);
+    } else {
+      if (activeId) {
+        const cur = conversations.find((c) => c.id === activeId);
+        if (cur) {
+          paneName.textContent = cur.name;
+          paneSub.textContent = cur.preview ? `最近：${cur.preview}` : '暂无消息';
+        }
+      }
+      renderList();
+    }
+  } catch (e) {
+    if (String(e.message).includes('未登录')) logout();
+  }
+}
+
+let lastListSig = '';
+
+function renderList(force = false) {
+  const keyword = searchInput.value.trim().toLowerCase();
+  const list = conversations.filter(
+    (c) =>
+      !keyword ||
+      (c.name || '').toLowerCase().includes(keyword) ||
+      (c.visitorName || '').toLowerCase().includes(keyword) ||
+      (c.preview || '').toLowerCase().includes(keyword)
+  );
+
+  const sig =
+    list
+      .map((c) => `${c.id}:${c.unread}:${c.lastMessageAt}:${c.preview}:${c.name}:${c.online ? 1 : 0}`)
+      .join('|') + `#${keyword}#${activeId}`;
+  if (!force && sig === lastListSig) return;
+  lastListSig = sig;
+
+  if (!list.length) {
+    convList.innerHTML = `<div class="conv-empty">${
+      conversations.length ? '没有匹配的会话' : '暂无访客会话，把访客端网址发给顾客即可'
+    }</div>`;
+    return;
+  }
+
+  convList.innerHTML = '';
+  for (const c of list) {
+    const item = document.createElement('div');
+    item.className = 'conv-item' + (c.id === activeId ? ' active' : '');
+    item.dataset.id = c.id;
+
+    const av = document.createElement('div');
+    av.className = 'conv-avatar';
+    av.textContent = (c.name || '访').slice(0, 1);
+
+    const body = document.createElement('div');
+    body.className = 'conv-body';
+
+    const name = document.createElement('div');
+    name.className = 'conv-name';
+    name.textContent = c.name || '访客';
+    if (c.remark) {
+      const tag = document.createElement('span');
+      tag.className = 'remark-tag';
+      tag.textContent = '备注';
+      name.appendChild(tag);
+    }
+    if (c.online) {
+      const dot = document.createElement('span');
+      dot.className = 'online-dot';
+      dot.title = '对方在线';
+      name.appendChild(dot);
+    }
+
+    const preview = document.createElement('div');
+    preview.className = 'conv-preview';
+    preview.textContent = c.preview || '暂无消息';
+    body.append(name, preview);
+
+    const side = document.createElement('div');
+    side.className = 'conv-side';
+    const time = document.createElement('span');
+    time.className = 'conv-time';
+    time.textContent = fmtListTime(c.lastMessageAt || c.createdAt);
+    side.appendChild(time);
+    if (c.unread > 0) {
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = c.unread > 99 ? '99+' : String(c.unread);
+      side.appendChild(badge);
+    }
+
+    item.append(av, body, side);
+    item.setAttribute('role', 'button');
+    item.tabIndex = 0;
+    item.setAttribute('aria-label', `打开与 ${c.name || '访客'} 的会话`);
+    item.addEventListener('click', () => openConversation(c));
+    item.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        openConversation(c);
+      }
+    });
+    convList.appendChild(item);
+  }
+}
+
+/* ------------------------------ 打开会话 ------------------------------ */
+
+function openConversation(c) {
+  activeId = c.id;
+  paneEmpty.hidden = true;
+  chatHost.hidden = false;
+  remarkBtn.hidden = false;
+
+  const preview = (c.preview || '').replace(/^客服[:：]\s*/, '');
+  paneName.textContent = c.name || '访客';
+  paneSub.textContent = c.remark
+    ? `最近：${preview || '暂无消息'} · 访客自称 ${c.visitorName || '访客'}`
+    : preview
+    ? `最近：${preview}`
+    : '暂无消息';
+
+  appView.classList.add('mobile-open');
+  renderList();
+  chat.setConv(c.id);
+}
+
+/* ------------------------------ 备注 ------------------------------ */
+
+const remarkMask = document.getElementById('remark-mask');
+const remarkInput = document.getElementById('remark-input');
+
+remarkBtn.addEventListener('click', () => {
+  if (!activeId) return toast('请先选择会话');
+  const cur = conversations.find((c) => c.id === activeId);
+  remarkInput.value = cur ? cur.remark || '' : '';
+  remarkMask.hidden = false;
+  remarkInput.focus();
+});
+
+async function saveRemark(value) {
+  if (!activeId) return;
+  try {
+    const data = await api(`/api/conversations/${activeId}/remark`, {
+      method: 'POST',
+      body: JSON.stringify({ remark: value }),
+    });
+    const cur = conversations.find((c) => c.id === activeId);
+    if (cur) {
+      cur.remark = data.remark || '';
+      cur.name = data.name;
+    }
+    paneName.textContent = data.name;
+    renderList(true);
+    remarkMask.hidden = true;
+    toast(value ? '备注已保存' : '备注已清除');
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+document.getElementById('remark-save').addEventListener('click', () => saveRemark(remarkInput.value.trim()));
+document.getElementById('remark-clear').addEventListener('click', () => {
+  remarkInput.value = '';
+  saveRemark('');
+});
+remarkInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') saveRemark(remarkInput.value.trim());
+});
+
+/* ------------------------------ 设置 ------------------------------ */
+
+const settingsMask = document.getElementById('settings-mask');
+const settingsError = document.getElementById('settings-error');
+const usageFill = document.getElementById('usage-fill');
+const usageLine = document.getElementById('usage-line');
+const usageSub = document.getElementById('usage-sub');
+const usageEst = document.getElementById('usage-est');
+
+const settingsBtn = document.getElementById('open-settings');
+
+const avatarPreview = document.getElementById('avatar-preview');
+const avatarFile = document.getElementById('avatar-file');
+
+function renderAvatarPreview() {
+  avatarPreview.innerHTML = '';
+  if (agentAvatarUrl) {
+    const img = document.createElement('img');
+    img.src = agentAvatarUrl;
+    img.alt = '客服头像';
+    avatarPreview.appendChild(img);
+  } else {
+    const span = document.createElement('span');
+    span.textContent = (agentName || '客').slice(0, 1);
+    avatarPreview.appendChild(span);
+  }
+  document.getElementById('avatar-clear').hidden = !agentAvatarUrl;
+}
+
+document.getElementById('avatar-pick').addEventListener('click', () => avatarFile.click());
+
+avatarFile.addEventListener('change', async () => {
+  const f = avatarFile.files[0];
+  if (!f) return;
+  const fd = new FormData();
+  fd.append('file', f);
+  try {
+    const r = await api('/api/avatar', { method: 'POST', body: fd });
+    agentAvatarUrl = r.avatarUrl || '';
+    renderAvatarPreview();
+    toast('头像已更新');
+  } catch (e) {
+    toast(e.message);
+  }
+  avatarFile.value = '';
+});
+
+document.getElementById('avatar-clear').addEventListener('click', async () => {
+  try {
+    const r = await api('/api/avatar/clear', { method: 'POST', body: JSON.stringify({}) });
+    agentAvatarUrl = r.avatarUrl || '';
+    renderAvatarPreview();
+    toast('头像已清除');
+  } catch (e) {
+    toast(e.message);
+  }
+});
+
+async function loadUsage() {
+  usageLine.textContent = '读取中…';
+  usageSub.textContent = '';
+  usageEst.textContent = '';
+  try {
+    const u = await api('/api/stats');
+    const pct = Math.max(0, Math.min(100, u.usedPercent || 0));
+    usageFill.style.width = `${pct < 1 && pct > 0 ? 1 : pct}%`;
+    usageLine.textContent = `已用 ${u.usedHuman} / 共 ${u.limitHuman}（${pct}%）· 剩余 ${u.remainingHuman}`;
+    usageSub.textContent = `会话 ${u.counts.conversations} 个 · 消息 ${u.counts.messages} 条（文字 ${u.counts.activeMessages}）· 图片 ${u.counts.images} 张`;
+    usageEst.textContent =
+      u.estimate.imagesLeft === null
+        ? `按当前平均每条 ${u.estimate.avgMessageBytes} 字节估算，还能发约 ${u.estimate.textMessagesLeft.toLocaleString()} 条文字；图片存 R2，不占这 5GB`
+        : `按当前平均估算，还能发约 ${u.estimate.textMessagesLeft.toLocaleString()} 条文字，或约 ${u.estimate.imagesLeft.toLocaleString()} 张图片`;
+    document.getElementById('set-clean-days').value = String(u.autoCleanDays || 0);
+    if (u.cleanup) toast(`已自动清理 ${u.cleanup.messages} 条旧消息`);
+  } catch (e) {
+    usageLine.textContent = `读取失败：${e.message}`;
+  }
+}
+
+document.getElementById('usage-refresh').addEventListener('click', () => {
+  loadUsage();
+});
+
+document.getElementById('usage-clean-now').addEventListener('click', async () => {
+  const days = Math.floor(Number(document.getElementById('set-clean-days').value || 0));
+  if (!Number.isFinite(days) || days <= 0) {
+    toast('先在上面填一个大于 0 的天数');
+    return;
+  }
+  if (!confirm(`确认删除 ${days} 天前的所有聊天消息？删除后无法恢复。`)) return;
+  try {
+    const r = await api('/api/cleanup', { method: 'POST', body: JSON.stringify({ days, confirm: true }) });
+    toast(`已清理 ${r.messages} 条消息、${r.files} 张图片、${r.conversations} 个会话`);
+    await loadUsage();
+    loadConversations();
+  } catch (e) {
+    toast(e.message);
+  }
+});
+
+settingsBtn.addEventListener('click', async () => {
+  settingsBtn.disabled = true;
+  settingsError.style.display = 'none';
+  try {
+    // 先把服务端设置拿到，再显示弹窗，避免异步回填把用户正在输入的内容覆盖掉
+    const s = await api('/api/settings');
+    settingsCache = s;
+    document.getElementById('set-shop').value = s.shopName || '';
+    document.getElementById('set-agent').value = s.agentName || agentName;
+    document.getElementById('set-welcome-enabled').checked = !!s.welcomeEnabled;
+    document.getElementById('set-welcome').value = s.welcomeText || '';
+    document.getElementById('set-welcome-from').value = s.welcomeFrom || '客服';
+    document.getElementById('set-passcode').value = '';
+    agentAvatarUrl = s.agentAvatarUrl || '';
+    renderAvatarPreview();
+    settingsMask.hidden = false;
+    loadUsage();
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    settingsBtn.disabled = false;
+  }
+});
+
+document.getElementById('settings-save').addEventListener('click', async () => {
+  const payload = {
+    shopName: document.getElementById('set-shop').value.trim(),
+    agentName: document.getElementById('set-agent').value.trim(),
+    welcomeEnabled: document.getElementById('set-welcome-enabled').checked,
+    welcomeText: document.getElementById('set-welcome').value,
+    welcomeFrom: document.getElementById('set-welcome-from').value.trim(),
+    autoCleanDays: Math.floor(Number(document.getElementById('set-clean-days').value || 0)),
+  };
+  const newPasscode = document.getElementById('set-passcode').value.trim();
+  if (newPasscode) {
+    if (newPasscode.length < 4) {
+      settingsError.textContent = '新口令至少 4 位';
+      settingsError.style.display = 'block';
+      return;
+    }
+    payload.newPasscode = newPasscode;
+  }
+
+  try {
+    const data = await api('/api/settings', { method: 'POST', body: JSON.stringify(payload) });
+    agentName = data.agentName || agentName;
+    localStorage.setItem(NAME_KEY, agentName);
+    document.getElementById('agent-name-label').textContent = agentName;
+    renderAvatarPreview();
+    document.getElementById('sidebar-title').textContent = data.shopName || '客服工作台';
+    settingsMask.hidden = true;
+    toast('设置已保存');
+  } catch (e) {
+    settingsError.textContent = e.message;
+    settingsError.style.display = 'block';
+  }
+});
+
+document.querySelectorAll('[data-close]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const which = btn.dataset.close;
+    document.getElementById(which === 'settings' ? 'settings-mask' : 'remark-mask').hidden = true;
+  });
+});
+
+document.querySelectorAll('.modal-mask').forEach((mask) => {
+  mask.addEventListener('click', (e) => {
+    if (e.target === mask) mask.hidden = true;
+  });
+});
+
+document.getElementById('back-btn').addEventListener('click', () => {
+  appView.classList.remove('mobile-open');
+});
+
+searchInput.addEventListener('input', renderList);
+
+/* ------------------------------ 退出 ------------------------------ */
+
+async function logout() {
+  clearInterval(listTimer);
+  localStorage.removeItem(TOKEN_KEY);
+  if (chat) chat.destroy();
+  location.reload();
+}
+document.getElementById('logout').addEventListener('click', logout);
+
+/* ------------------------------ 启动 ------------------------------ */
+
+const savedToken = localStorage.getItem(TOKEN_KEY);
+const savedName = localStorage.getItem(NAME_KEY) || '';
+if (savedToken) {
+  agentToken = savedToken;
+  agentName = savedName || '客服';
+  // 用已保存的 token 直接进工作台；token 失效会在拉列表时报未登录，自动回登录页
+  fetch('/api/me', { headers: { authorization: `Bearer ${savedToken}` } })
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error('expired'))))
+    .then((me) => {
+      agentName = me.name || agentName;
+      enterApp(me);
+    })
+    .catch(() => {
+      localStorage.removeItem(TOKEN_KEY);
+      tokenInput.focus();
+    });
+} else {
+  tokenInput.focus();
+}
+</script>
+</body>
+</html>

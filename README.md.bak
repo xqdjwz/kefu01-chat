@@ -1,0 +1,179 @@
+# 在线客服聊天系统 · 部署说明（全程网页操作，不用命令行）
+
+> 这份说明对应 `cf-kefu-chat-修复版.zip`。解压后你会看到 `src`、`public`、`wrangler.toml` 等文件，**不要改动目录结构**，整个上传即可。
+
+---
+
+## 一、先看功能（都已实测通过）
+
+| 需求 | 现在的实现 |
+| --- | --- |
+| 前台打开域名就能对话 | `/` 直接进聊天，不用注册；身份存在浏览器本地，刷新不丢记录 |
+| 后台输入口令登录 | `/agent` 输入「客服名称 + 口令」进入；**第一次登录时输入的口令，自动成为系统口令** |
+| 互相实时聊天 | 双方 2 秒内自动同步（页面在后台时降到 8 秒，回到前台立即补拉） |
+| 文字 / 表情 / 图片 | 输入框右侧有表情面板；图片选完自动压缩再上传 |
+| 撤回 | 120 秒内可撤回，只有发送方能撤，双方都显示"撤回了一条消息" |
+| 删除 | 只对自己隐藏，对方那边不受影响 |
+| 备注顾客 | 会话右上角铅笔按钮，备注只在自己工作台显示 |
+| 修改客服名称 | 工作台「设置」里改，改完新消息就用新名字 |
+| 自动欢迎语 | 「设置」里可开关、改内容、改署名；新访客进来自动发一条 |
+| 已读 / 未读 | 自己发的消息下方显示「已读 / 未读」；会话列表有未读数字角标 |
+| 空间用量 | 「设置」里直接显示已用多少 / 共 5GB / 剩余多少、还能发多少条，可设自动清理 |
+
+预览图在压缩包的 `预览/` 目录里（访客端、客服后台、后台登录、设置面板、备注弹窗、手机端）。
+
+---
+
+## 二、需要准备什么
+
+1. 一个 Cloudflare 账号（免费注册，不要信用卡）
+2. 一个 GitHub 账号（免费）
+3. 电脑浏览器（Chrome / Edge 都行）
+
+D1 数据库、Workers 都在免费额度里，不用买服务器、不用买数据库。
+
+---
+
+## 三、五步部署
+
+### 第 1 步：在 Cloudflare 建一个 D1 数据库
+
+1. 登录 Cloudflare → 左侧菜单找到 **存储和数据库 / Storage & Databases** → **D1 SQL Database**
+2. 点 **Create database / 创建数据库**，名称填 `cf_kefu`（必须一致，也可以改 `wrangler.toml` 里的名字）
+3. 创建好进入数据库详情页，复制页面上的 **Database ID**（一串像 `a1b2c3d4-1234-...` 的字符），先记在记事本里
+
+> 建库时**不用**建表、不用执行任何 SQL —— 程序第一次运行会自己把表建好。
+
+### 第 2 步：把代码上传到 GitHub
+
+1. GitHub 右上角 **+ → New repository**，仓库名填 `cf-kefu-chat`，选 Public 或 Private 都行，创建
+2. 在新仓库页面点 **uploading an existing file / 上传文件**
+3. 把解压出来的**所有文件和文件夹**（`src`、`public`、`migrations`、`docs`、`.github`、`wrangler.toml`、`package.json`、`README.md` 等）一起拖进网页上传框
+4. 下方填一句提交说明，点 **Commit changes**
+
+> 拖整个文件夹进去，GitHub 网页会保留目录结构。传完刷新页面，确认能看到 `src/index.js`、`public/index.html`、`wrangler.toml`。
+
+### 第 3 步：把数据库 ID 填进 `wrangler.toml`
+
+1. 在 GitHub 仓库里点开 `wrangler.toml`
+2. 点右上角铅笔图标进入编辑
+3. 找到这一行：
+
+```
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+```
+
+把引号里的内容换成第 1 步复制的 **Database ID**，例如：
+
+```
+database_id = "a1b2c3d4-1234-5678-9999-abcdefabcdef"
+```
+
+4. 页面下方 **Commit changes** 保存
+
+### 第 4 步：让 Cloudflare 自动部署这个仓库
+
+1. Cloudflare 控制台 → **Workers & Pages** → **Create / 创建**
+2. 选 **Workers** → **Import a repository / 导入仓库**（第一次用会让你授权 GitHub，点同意、选中刚才的仓库）
+3. 选中仓库 `cf-kefu-chat`，分支选 `main`
+4. 构建命令填：`npm install`
+   部署命令填：`npx wrangler deploy`
+   （如果页面已有默认值，留着默认的也行，只要最终是 `npx wrangler deploy`）
+5. 点 **Save and Deploy / 保存并部署**，等 1～2 分钟
+
+部署成功后页面会给你一个网址，形如：
+
+```
+https://cf-kefu-chat.你的子域.workers.dev
+```
+
+- 访客端 = 这个网址本身
+- 客服工作台 = 网址后面加 `/agent`
+
+以后你在 GitHub 上改任何文件（包括改 `wrangler.toml` 的配置），Cloudflare 都会自动重新部署，不需要手动操作。
+
+### 第 5 步：第一次登录，把口令定下来
+
+1. 手机或电脑打开 `https://xxx.workers.dev/agent`
+2. **客服名称**：填你想显示的名字（例如 `小旗`）
+3. **客服口令**：随便设一个 ≥ 4 位的口令（**这一次输入的口令就会成为系统口令**，之后所有客服都用它登录）
+4. 点「进入工作台」
+
+进去后点左下角 **设置**，可以马上改：店铺名称、我的客服名称、欢迎语开关/内容/署名、口令。
+
+然后把这个访客端网址发给顾客，顾客点开就能聊天，你在工作台就能收到。
+
+---
+
+## 四、常见问题
+
+**Q：部署完打开是 500，提示"服务暂时不可用"？**
+大概率是 `wrangler.toml` 里的 `database_id` 还是占位符，或者填错了。回 GitHub 改成正确的 Database ID，等它自动重新部署（或到 Cloudflare 的 Deployments 点 Retry）。
+
+**Q：忘记客服口令了怎么办？**
+最简单的办法：Cloudflare 控制台 → Storage & Databases → D1 → `cf_kefu` → 打开 Console（SQL 控制台），执行：
+
+```sql
+DELETE FROM settings WHERE key = 'passcode_hash';
+DELETE FROM agents;
+```
+
+执行完再打开 `/agent`，重新输入名称和口令就等于重新设置了系统口令。（旧会话数据都还在。）
+
+**Q：想改店铺名、欢迎语、撤回时限？**
+店铺名和欢迎语在「工作台 → 设置」里改，立即生效。撤回时限在 GitHub 上改 `wrangler.toml` 的 `RECALL_WINDOW_SEC`（单位秒），提交后自动部署。
+
+**Q：图片发不出去，提示图片太大？**
+没开 R2 时图片存在 D1，单张上限 700KB（前端会自动压缩到 400KB 以内，一般手机截图、商品图都能发）。如果要发大图，可以启用 R2：
+1. Cloudflare 控制台 → **R2** → Create bucket，名字 `cf-kefu-files`（R2 需要在控制台里开通一次，可能要求绑定付款方式，免费额度 10GB）
+2. 在 GitHub 打开 `wrangler.toml`，把这三行前面的 `#` 去掉：
+
+```
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "cf-kefu-files"
+```
+
+3. 提交后自动部署，程序会自动优先用 R2 存图，D1 里不再存图。
+
+**Q：免费额度够用吗？**
+Workers 每天 10 万次请求，D1 每天 500 万行读取 / 10 万行写入。按"2 个客服台常开 + 十几个顾客在线"算，完全够用。客服台整天挂着不关时，建议关掉不用的浏览器标签页。
+
+**Q：想用 GitHub Actions 部署（不用 Workers Builds）？**
+仓库里有 `.github/workflows/deploy.yml`，需要你在 GitHub 仓库 `Settings → Secrets and variables → Actions` 里加两个 Secret：`CLOUDFLARE_API_TOKEN`（Cloudflare 后台 API Token，模板选 Edit Cloudflare Workers）和 `CLOUDFLARE_ACCOUNT_ID`（Cloudflare 首页右侧），然后在 Actions 页面点 **Run workflow** 手动跑。
+
+**Q：怎么看用了多少空间、还剩多少、能发多少条消息？**
+打开 `/agent` → 左下角「设置」，弹窗最下面就是「存储用量」：已用 / 共 5.0 GB / 剩余、会话与消息条数、按当前平均估算「还能发约多少条文字、多少张图片」，还有一个占比进度条。想清理就在同一节填「自动清理：只保留最近多少天」（0 = 关闭），或点「立即清理」按当前天数马上删一次。
+
+**Q：Cloudflare 会自己清理空间吗？**
+不会。D1 存满是硬上限，超了会开始报错。所以这一版内置了自动清理开关：填了天数（比如 90），后台打开设置页时检查一次、最多每 6 小时执行一次，自动删掉更早的消息和没人再用的图片，设置和口令不受影响。填 0 就是完全关闭。
+
+**Q：5GB 到底能发多少条？**
+纯文字每条约 300～400 字节，5GB 大约 1300 万～1800 万条；图片（没开 R2，前端压缩到 400KB 左右）约 1.2 万张。实际每天几百条的话，文字永远写不满。
+注意：真正容易先到顶的是**每天 10 万次请求**和**每天 10 万行写入**，这两个按天重置。访客端 + 客服端同时 2 秒轮询，全天开着约 8.6 万次请求/天，接近上限——客服不忙时把工作台标签页关掉就好。
+
+**Q：想用自己的域名？**
+Cloudflare 控制台 → Workers & Pages → 选中这个 Worker → **Settings → Domains & Routes → Add Custom Domain**，输入你的域名（域名需要先托管在 Cloudflare），保存即可。
+
+---
+
+## 五、文件说明（想自己改代码时看）
+
+```
+src/index.js                     后端：接口、自动建表、图片存储
+public/index.html                访客端页面
+public/agent.html                客服工作台（登录 / 设置 / 备注弹窗）
+public/assets/chat.js            两端共用聊天核心（轮询、表情、图片、撤回、已读）
+public/assets/app.css            两端样式
+wrangler.toml                    Cloudflare 配置（database_id 在这里填）
+migrations/*.sql                 建表 SQL（仅参考，程序会自动建表）
+.github/workflows/deploy.yml     可选：GitHub Actions 部署
+```
+
+常用调整：
+
+- 同步快慢：`public/assets/chat.js` 顶部 `POLL_VISIBLE = 2000`（毫秒）
+- 表情清单：同文件 `EMOJI_LIST`
+- 主题配色：`public/assets/app.css` 顶部 `--accent` 等变量
+
+改完在 GitHub 上提交，Cloudflare 自动部署生效。
