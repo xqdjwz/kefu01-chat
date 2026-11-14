@@ -74,6 +74,7 @@
           <div class="pane-sub" id="pane-sub">从左侧选择一个访客会话</div>
         </div>
         <button class="text-link pane-export" id="btn-export" type="button" title="导出该会话聊天记录" hidden>导出</button>
+        <button class="text-link pane-block" id="btn-block" type="button" title="拉黑该访客，对方将无法发消息" hidden>拉黑</button>
         <button class="rename-btn" id="btn-remark" type="button" title="备注该顾客" aria-label="备注该顾客" hidden>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
         </button>
@@ -508,7 +509,7 @@ async function enterApp(loginData = {}) {
       setTimeout(loadConversations, 400);
     },
     onIncoming: () => {
-      beep();
+      // 桌面端已在会话列表轮询里统一响铃，这里不重复响
     },
   });
 
@@ -519,10 +520,23 @@ async function enterApp(loginData = {}) {
 
 /* ------------------------------ 会话列表 ------------------------------ */
 
+let lastVisitorSeen = null;
+
 async function loadConversations() {
   try {
     const data = await api('/api/conversations');
     conversations = data.conversations || [];
+
+    // 不管有没有打开会话，只要有新的访客消息就响铃
+    const newest = conversations.reduce((m, c) => Math.max(m, Number(c.lastVisitorAt) || 0), 0);
+    if (lastVisitorSeen === null) {
+      lastVisitorSeen = newest;
+    } else if (newest > lastVisitorSeen) {
+      lastVisitorSeen = newest;
+      const hit = conversations.find((c) => (Number(c.lastVisitorAt) || 0) === newest);
+      if (!document.hidden) beep();
+      if (hit && hit.id !== activeId) showIncomingToast(hit);
+    }
     document.getElementById('conv-count').textContent = String(conversations.length);
 
     // 首次进入（桌面端）自动选中最新会话
@@ -603,7 +617,14 @@ function renderList(force = false) {
     preview.textContent = c.preview || '暂无消息';
     body.append(name, preview);
 
-    const geoBits = [c.ip, c.location].filter(Boolean).join(' ');
+    if (c.blocked) {
+      const tag = document.createElement('span');
+      tag.className = 'remark-tag is-blocked';
+      tag.textContent = '已拉黑';
+      name.appendChild(tag);
+    }
+
+    const geoBits = [c.ip, c.location, c.device].filter(Boolean).join(' ');
     if (geoBits) {
       const geo = document.createElement('div');
       geo.className = 'conv-geo';
@@ -657,7 +678,7 @@ function openConversation(c) {
     : '暂无消息';
 
   renderGeo(c);
-  renderGeo(c);
+  updateBlockBtn(c);
   appView.classList.add('mobile-open');
   renderList();
   chat.setConv(c.id);
@@ -672,6 +693,8 @@ function renderGeo(c) {
   if (c.ip) bits.push(`IP：${c.ip}`);
   if (c.location) bits.push(`位置：${c.location}`);
   if (c.referer) bits.push(`来源：${c.referer}`);
+  if (c.device) bits.push(`设备：${c.device}`);
+  if (c.blocked) bits.push('状态：已拉黑（对方发不了消息）');
   const ct = c.contact;
   if (ct) {
     const arr = [
@@ -690,6 +713,43 @@ function renderGeo(c) {
   box.hidden = false;
   box.textContent = bits.join(' · ');
 }
+
+function showIncomingToast(conv) {
+  const who = conv.name || conv.visitorName || '访客';
+  const text = `新消息 · ${who}：${(conv.preview || '').slice(0, 30)}`;
+  toast(text);
+}
+
+function updateBlockBtn(c) {
+  const btn = document.getElementById('btn-block');
+  if (!btn) return;
+  const blocked = !!(c && c.blocked);
+  btn.hidden = !c;
+  btn.textContent = blocked ? '撤销拉黑' : '拉黑';
+  btn.classList.toggle('is-off', blocked);
+}
+
+document.getElementById('btn-block').addEventListener('click', async () => {
+  if (!activeId) return toast('请先选择会话');
+  const cur = conversations.find((x) => x.id === activeId);
+  const blocked = !(cur && cur.blocked);
+  if (blocked && !confirm('拉黑后这位访客将无法再发消息，聊天记录保留。确定拉黑？')) return;
+  try {
+    const r = await api(`/api/conversations/${encodeURIComponent(activeId)}/block`, {
+      method: 'POST',
+      body: JSON.stringify({ blocked }),
+    });
+    if (cur) cur.blocked = !!r.blocked;
+    const box = document.getElementById('pane-geo');
+    if (box) box.hidden = true;
+    if (cur) renderGeo(cur);
+    updateBlockBtn(cur);
+    renderList(true);
+    toast(r.blocked ? '已拉黑该访客' : '已撤销拉黑');
+  } catch (e) {
+    toast(e.message);
+  }
+});
 
 document.getElementById('btn-export').addEventListener('click', async () => {
   if (!activeId) return toast('请先选择会话');

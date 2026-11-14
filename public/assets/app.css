@@ -1572,3 +1572,48 @@ img {
   font-size: 13px;
   padding: 8px 12px;
 }
+
+/* 拉黑 */
+.remark-tag.is-blocked {
+  background: rgba(220, 38, 38, 0.12);
+  color: #dc2626;
+}
+.pane-block {
+  margin-left: 8px;
+}
+.pane-block.is-off {
+  color: #b45309;
+}
+.blocked-banner {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  font-size: 13px;
+  color: #b91c1c;
+  background: #fef2f2;
+  border-bottom: 1px solid #fecaca;
+}
+.blocked-banner.show {
+  display: flex;
+}
+
+/* 会话顶部：导出 / 拉黑文字按钮（白底上要看得见） */
+.agent-pane-head .text-link {
+  color: #c2410c;
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  background: #fff4ec;
+  margin-right: 8px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.agent-pane-head .text-link:hover {
+  color: #ffffff;
+  background: #e8552b;
+}
+.agent-pane-head .text-link.is-off {
+  color: #b91c1c;
+  background: #fef2f2;
+}

@@ -44,6 +44,8 @@
       <div class="login-error" id="contact-error"></div>
     </div>
 
+    <div class="blocked-banner" id="blocked-banner">本次对话已被客服关闭，暂时无法继续发送消息。</div>
+
     <div id="chat-host" class="chat-host">
       <div class="chat-empty"><p>正在连接客服…</p></div>
     </div>
@@ -143,6 +145,8 @@ async function boot() {
       peerAvatarUrl: '/api/avatar/agent',
       emptyText: '您好，有任何问题都可以在这里留言，客服会尽快回复（支持图片和表情）',
     });
+
+    if (data.blocked) applyBlockedUI();
   } catch (e) {
     showError(e.message || '网络连接失败，请稍后重试');
   }
@@ -193,6 +197,21 @@ document.getElementById('contact-save').addEventListener('click', async () => {
     btn.disabled = false;
   }
 });
+
+function applyBlockedUI() {
+  const banner = document.getElementById('blocked-banner');
+  if (banner) banner.classList.add('show');
+  const composer = document.querySelector('.composer');
+  if (!composer) return;
+  const ta = composer.querySelector('textarea');
+  if (ta) {
+    ta.disabled = true;
+    ta.placeholder = '客服已关闭本次对话';
+  }
+  composer.querySelectorAll('button').forEach((b) => {
+    b.disabled = true;
+  });
+}
 
 boot();
 </script>

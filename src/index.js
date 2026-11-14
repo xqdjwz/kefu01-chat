@@ -205,6 +205,8 @@ const ALTERS = [
   'ALTER TABLE conversations ADD COLUMN geo_location TEXT',
   'ALTER TABLE conversations ADD COLUMN geo_referer TEXT',
   'ALTER TABLE conversations ADD COLUMN contact TEXT',
+  'ALTER TABLE conversations ADD COLUMN geo_device TEXT',
+  'ALTER TABLE conversations ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE messages ADD COLUMN auto_reply INTEGER NOT NULL DEFAULT 0',
 ];
 
@@ -392,6 +394,9 @@ async function handleApi(request, env, url, ctx) {
   if (remarkMatch && method === 'POST') return handleRemark(request, env, remarkMatch[1]);
 
   // 兼容旧接口名
+  const blockMatch = path.match(/^\/api\/conversations\/([a-zA-Z0-9_-]+)\/block$/);
+  if (blockMatch && method === 'POST') return handleBlock(request, env, blockMatch[1]);
+
   const renameMatch = path.match(/^\/api\/conversations\/([a-zA-Z0-9_-]+)\/rename$/);
   if (renameMatch && method === 'POST') return handleRemark(request, env, renameMatch[1]);
 
@@ -801,9 +806,51 @@ const mapConv = (row) => {
     ip: row.geo_ip || '',
     location: row.geo_location || '',
     referer: row.geo_referer || '',
+    device: row.geo_device || '',
+    blocked: !!row.blocked,
+    lastVisitorAt: row.last_visitor_at || 0,
     contact: parseContact(row.contact),
   };
 };
+
+function deviceOf(request, body) {
+  let ua = '';
+  try {
+    ua = (request.headers.get('user-agent') || '').slice(0, 300);
+  } catch {
+    ua = '';
+  }
+  if (typeof body.device === 'string' && body.device.trim()) ua = body.device.slice(0, 300);
+  if (!ua) return '';
+
+  let os = '';
+  if (/iPhone/i.test(ua)) os = 'iPhone';
+  else if (/iPad/i.test(ua)) os = 'iPad';
+  else if (/Android/i.test(ua)) {
+    const m = ua.match(/Android[^;)]*;\s*([^;)]+)/i);
+    os = m && m[1] ? 'Android ' + m[1].replace(/Build.*/i, '').trim().slice(0, 18) : 'Android';
+  } else if (/Windows/i.test(ua)) os = 'Windows';
+  else if (/Macintosh|Mac OS X/i.test(ua)) os = 'Mac';
+  else if (/Linux/i.test(ua)) os = 'Linux';
+
+  let app = '';
+  if (/MicroMessenger/i.test(ua)) app = '微信';
+  else if (/\bQQ\//i.test(ua) || /QQBrowser/i.test(ua)) app = 'QQ';
+  else if (/DingTalk/i.test(ua)) app = '钉钉';
+  else if (/AlipayClient/i.test(ua)) app = '支付宝';
+  else if (/Weibo/i.test(ua)) app = '微博';
+
+  let browser = '';
+  if (/Edg\//i.test(ua)) browser = 'Edge';
+  else if (/OPR\//i.test(ua)) browser = 'Opera';
+  else if (/Firefox\//i.test(ua)) browser = 'Firefox';
+  else if (/Chrome\//i.test(ua)) browser = 'Chrome';
+  else if (/Safari\//i.test(ua)) browser = 'Safari';
+
+  const parts = [os, app || browser].filter(Boolean);
+  const text = parts.join(' · ');
+  return text.slice(0, 40) || (ua ? '未知设备' : '');
+}
 
 function geoOf(request, body) {
   const cf = (request && request.cf) || {};
@@ -821,6 +868,7 @@ function geoOf(request, body) {
     ip: String(ip || '').split(',')[0].trim().slice(0, 64),
     location: location.slice(0, 80),
     referer,
+    device: deviceOf(request, body),
   };
 }
 
@@ -849,6 +897,7 @@ async function handleSession(request, env) {
       if (!conv.geo_location && geo.location) patch.geo_location = geo.location;
       const keepReferer = conv.geo_referer && !conv.geo_referer.includes('localhost');
       if (!keepReferer && geo.referer) patch.geo_referer = geo.referer;
+      if (!conv.geo_device && geo.device) patch.geo_device = geo.device;
       const sets = Object.keys(patch)
         .map((k) => `${k} = ?`)
         .join(', ');
@@ -866,7 +915,10 @@ async function handleSession(request, env) {
           lastMessageAt: conv.last_message_at || conv.created_at,
           createdAt: conv.created_at,
           unread: 0,
+          device: conv.geo_device || geo.device || '',
+          blocked: !!conv.blocked,
         },
+        blocked: !!conv.blocked,
         shop,
         welcome: { enabled: s.welcome_enabled === '1', text: s.welcome_text },
         contactEnabled: s.contact_enabled === '1',
@@ -880,9 +932,9 @@ async function handleSession(request, env) {
   const visitorName = name || '访客';
 
   await env.DB.prepare(
-    'INSERT INTO conversations (id, visitor_token, visitor_name, created_at, updated_at, visitor_seen_at, geo_ip, geo_location, geo_referer) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    'INSERT INTO conversations (id, visitor_token, visitor_name, created_at, updated_at, visitor_seen_at, geo_ip, geo_location, geo_referer, geo_device) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
   )
-    .bind(id, newToken, visitorName, t, t, t, geo.ip || null, geo.location || null, geo.referer || null)
+    .bind(id, newToken, visitorName, t, t, t, geo.ip || null, geo.location || null, geo.referer || null, geo.device || null)
     .run();
 
   // 自动欢迎语：只在新会话时发一条
@@ -908,7 +960,8 @@ async function handleSession(request, env) {
 
   return json({
     token: newToken,
-    conv: { id, name: visitorName, visitorName, remark: '', preview, lastMessageAt: t, createdAt: t, unread: 0 },
+    conv: { id, name: visitorName, visitorName, remark: '', preview, lastMessageAt: t, createdAt: t, unread: 0, device: geo.device || '', blocked: false },
+    blocked: false,
     shop,
     welcome: { enabled: s.welcome_enabled === '1', text: s.welcome_text },
     contactEnabled: s.contact_enabled === '1',
@@ -921,13 +974,32 @@ async function handleConversationList(env) {
        SELECT COUNT(*) FROM messages m
        WHERE m.conv_id = c.id AND m.sender = 'visitor'
          AND m.read_at IS NULL AND m.deleted_agent = 0 AND m.status = 'active'
-     ) AS unread
+     ) AS unread, (
+       SELECT MAX(m.created_at) FROM messages m
+       WHERE m.conv_id = c.id AND m.sender = 'visitor' AND m.status = 'active'
+     ) AS last_visitor_at
      FROM conversations c
      ORDER BY COALESCE(c.last_message_at, c.created_at) DESC
      LIMIT 100`
   ).all();
 
   return json({ conversations: (results || []).map(mapConv) });
+}
+
+async function handleBlock(request, env, convId) {
+  const ident = await identify(request, env);
+  if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
+
+  const body = await safeBody(request);
+  const blocked = body.blocked === undefined ? true : !!body.blocked;
+  await env.DB.prepare('UPDATE conversations SET blocked = ?, updated_at = ? WHERE id = ?')
+    .bind(blocked ? 1 : 0, now(), convId)
+    .run();
+
+  if (blocked) {
+    pushCooldown.delete(convId);
+  }
+  return json({ ok: true, blocked });
 }
 
 async function handleRemark(request, env, convId) {
@@ -1062,6 +1134,7 @@ const plainOf = (lines) =>
     .replace(/\*\*/g, '');
 
 async function pushWeChat(env, conv, text) {
+  if (conv && conv.blocked) return;
   const s = await getSettings(env);
   if (s.wechat_push_enabled !== '1') return;
 
@@ -1176,6 +1249,9 @@ async function handleContact(request, env) {
 
   const s = await getSettings(env);
   if (s.contact_enabled !== '1') return fail('未开启联系方式收集', 403, 'disabled');
+
+  const convRow = await env.DB.prepare('SELECT blocked FROM conversations WHERE id = ?').bind(ident.convId).first();
+  if (convRow && convRow.blocked) return fail('本次对话已被客服关闭', 403, 'blocked');
 
   const body = await safeBody(request);
   const phone = String(body.phone || '').trim().slice(0, 20);
@@ -1295,6 +1371,9 @@ async function handleSendMessage(request, env, url, ctx) {
 
   const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
   if (!conv) return fail('会话不存在', 404, 'not_found');
+  if (ident.role === 'visitor' && conv.blocked) {
+    return fail('本次对话已被客服关闭，暂时无法发送消息', 403, 'blocked');
+  }
 
   const type = body.type === 'image' ? 'image' : 'text';
   const text = String(body.body || '').trim();
