@@ -170,13 +170,24 @@
         <div class="switch-row">
           <div>
             <div class="switch-title">新消息提示音</div>
-            <div class="switch-desc">客服端收到访客消息时响一声（需先在页面上点一下）</div>
+            <div class="switch-desc">客服端收到访客消息时响铃（需先在页面上点一下）</div>
           </div>
           <label class="switch">
             <input type="checkbox" id="set-sound">
             <span class="switch-track"><span class="switch-thumb"></span></span>
           </label>
         </div>
+        <div class="sound-row">
+          <label class="field-label" for="set-sound-repeat" style="margin:0">响铃次数</label>
+          <input class="field-input sound-count" id="set-sound-repeat" type="number" min="1" max="5" step="1" value="3">
+          <button class="btn-ghost" id="sound-test" type="button">试听</button>
+        </div>
+        <div class="sound-row">
+          <button class="btn-ghost" id="sound-pick" type="button">上传自定义提示音</button>
+          <button class="btn-ghost" id="sound-clear" type="button" hidden>恢复默认铃声</button>
+          <input type="file" id="sound-file" accept="audio/mpeg,audio/mp3,audio/mp4,audio/x-m4a,audio/ogg,audio/wav,audio/x-wav,audio/aac" hidden>
+        </div>
+        <div class="avatar-hint" style="margin:2px 0 4px">不传就用内置"叮咚"铃声；自定义建议 2～5 秒、300KB 以内，格式 MP3 / M4A / OGG / WAV</div>
 
         <div class="switch-row">
           <div>
@@ -222,19 +233,35 @@
         </div>
 
         <div class="kw-block">
-          <div class="usage-head"><span>微信推送通知（可选）</span></div>
-          <div class="kw-tip">去 sct.ftqq.com 微信扫码登录，复制 SendKey 填在这里。有新访客消息时推送到你微信。</div>
+          <div class="usage-head"><span>消息推送通知（可多选，填几个推几个）</span></div>
+          <div class="kw-tip">客服没开着网页时也能收到提醒。下面 5 个渠道都免费，填哪个就推哪个，可以同时开多个。</div>
           <div class="switch-row kw-switch">
             <div>
-              <div class="switch-title">开启微信推送</div>
-              <div class="switch-desc">客服离开网页时也能收到提醒</div>
+              <div class="switch-title">开启推送</div>
+              <div class="switch-desc">关闭后下面所有渠道都不发</div>
             </div>
             <label class="switch">
               <input type="checkbox" id="set-wechat">
               <span class="switch-track"><span class="switch-thumb"></span></span>
             </label>
           </div>
-          <input class="field-input" id="set-sendkey" maxlength="60" placeholder="Server酱 SendKey，例如 SCT123456xxxx">
+
+          <label class="field-label" for="set-sendkey" style="margin-top:10px">① Server酱（微信）</label>
+          <input class="field-input" id="set-sendkey" maxlength="60" placeholder="sct.ftqq.com 的 SendKey，例如 SCT123456xxxx">
+
+          <label class="field-label" for="set-pushplus" style="margin-top:10px">② PushPlus（微信）</label>
+          <input class="field-input" id="set-pushplus" maxlength="60" placeholder="pushplus.plus 的 token（微信扫码登录后复制）">
+
+          <label class="field-label" for="set-dingtalk" style="margin-top:10px">③ 钉钉群机器人</label>
+          <input class="field-input" id="set-dingtalk" maxlength="300" placeholder="https://oapi.dingtalk.com/robot/send?access_token=xxx">
+
+          <label class="field-label" for="set-wecom" style="margin-top:10px">④ 企业微信群机器人</label>
+          <input class="field-input" id="set-wecom" maxlength="300" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx">
+
+          <label class="field-label" for="set-bark" style="margin-top:10px">⑤ Bark（iPhone 通知）</label>
+          <input class="field-input" id="set-bark" maxlength="300" placeholder="https://api.day.app/你的Key">
+
+          <div class="usage-note">同一个会话 5 秒内最多推一条，避免刷屏。推送失败不影响聊天。钉钉/企业微信机器人记得在群里把"自定义关键词"或"加签"设置成不限制，否则会拒收。</div>
         </div>
 
         <div class="usage-block">
@@ -290,6 +317,8 @@ let agentName = '客服';
 let agentAvatarUrl = '';
 let soundEnabled = true;
 let agentOnline = true;
+let soundRepeat = 3;
+let soundUrl = '';
 let conversations = [];
 let activeId = null;
 let chat = null;
@@ -321,25 +350,56 @@ async function api(path, init = {}) {
 
 /* ------------------------------ 提示音 / 状态 ------------------------------ */
 
+// 内置铃声：叮—咚 双音，比原来的单声更长更响
+function chimeAt(ctx, t0) {
+  const notes = [
+    { f: 880, at: 0, dur: 0.45, vol: 0.6 },
+    { f: 660, at: 0.3, dur: 0.6, vol: 0.55 },
+    { f: 990, at: 0.62, dur: 0.35, vol: 0.35 },
+  ];
+  for (const n of notes) {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.value = n.f;
+    const s0 = t0 + n.at;
+    gain.gain.setValueAtTime(0.0001, s0);
+    gain.gain.exponentialRampToValueAtTime(n.vol, s0 + 0.03);
+    gain.gain.exponentialRampToValueAtTime(0.0001, s0 + n.dur);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(s0);
+    osc.stop(s0 + n.dur + 0.03);
+  }
+}
+
+function playCustomSound(url) {
+  let count = 0;
+  const once = () => {
+    const audio = new Audio(url);
+    audio.volume = 1;
+    audio.play().catch(() => {});
+    count += 1;
+    if (count < Math.max(1, Math.min(5, soundRepeat))) setTimeout(once, 1600);
+  };
+  once();
+}
+
 function beep() {
   if (!soundEnabled) return;
   try {
+    if (soundUrl) {
+      playCustomSound(soundUrl);
+      return;
+    }
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return;
     beep.ctx = beep.ctx || new AC();
     const ctx = beep.ctx;
     if (ctx.state === 'suspended') ctx.resume();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.type = 'sine';
-    osc.frequency.value = 880;
-    gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.22, ctx.currentTime + 0.05);
-    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.35);
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start();
-    osc.stop(ctx.currentTime + 0.4);
+    const times = Math.max(1, Math.min(5, soundRepeat));
+    const t0 = ctx.currentTime + 0.06;
+    for (let i = 0; i < times; i += 1) chimeAt(ctx, t0 + i * 1.25);
   } catch {
     /* 静默失败 */
   }
@@ -363,6 +423,8 @@ async function loadAgentSettings() {
   soundEnabled = !!s.soundEnabled;
   agentOnline = !!s.agentOnline;
   agentAvatarUrl = s.agentAvatarUrl || '';
+  soundRepeat = Number(s.soundRepeat) || 3;
+  soundUrl = s.soundUrl || '';
   updateOnlineLabel();
   return s;
 }
@@ -758,6 +820,51 @@ avatarFile.addEventListener('change', async () => {
   avatarFile.value = '';
 });
 
+document.getElementById('sound-test').addEventListener('click', () => {
+  soundRepeat = Math.max(1, Math.min(5, Math.floor(Number(document.getElementById('set-sound-repeat').value || 3))));
+  const wasEnabled = soundEnabled;
+  soundEnabled = true;
+  beep();
+  soundEnabled = wasEnabled;
+});
+
+document.getElementById('sound-pick').addEventListener('click', () => document.getElementById('sound-file').click());
+
+document.getElementById('sound-file').addEventListener('change', async () => {
+  const input = document.getElementById('sound-file');
+  const f = input.files[0];
+  if (!f) return;
+  if (f.size > 400 * 1024) {
+    toast('音频请小于 400KB（建议 2～5 秒）');
+    input.value = '';
+    return;
+  }
+  const fd = new FormData();
+  fd.append('file', f);
+  try {
+    const r = await api('/api/sound', { method: 'POST', body: fd });
+    soundUrl = r.soundUrl || '';
+    soundEnabled = true;
+    document.getElementById('set-sound').checked = true;
+    document.getElementById('sound-clear').hidden = !soundUrl;
+    toast('提示音已更新，点「试听」听一下');
+  } catch (e) {
+    toast(e.message);
+  }
+  input.value = '';
+});
+
+document.getElementById('sound-clear').addEventListener('click', async () => {
+  try {
+    const r = await api('/api/settings', { method: 'POST', body: JSON.stringify({ clearSound: true }) });
+    soundUrl = r.soundUrl || '';
+    document.getElementById('sound-clear').hidden = !soundUrl;
+    toast('已恢复内置铃声');
+  } catch (e) {
+    toast(e.message);
+  }
+});
+
 document.getElementById('avatar-clear').addEventListener('click', async () => {
   try {
     const r = await api('/api/avatar/clear', { method: 'POST', body: JSON.stringify({}) });
@@ -835,6 +942,14 @@ settingsBtn.addEventListener('click', async () => {
     document.getElementById('set-offline-keywords').value = rulesToText(s.offlineKeywords);
     document.getElementById('set-wechat').checked = !!s.wechatPushEnabled;
     document.getElementById('set-sendkey').value = s.wechatSendKey || '';
+    document.getElementById('set-pushplus').value = s.pushplusToken || '';
+    document.getElementById('set-dingtalk').value = s.dingtalkWebhook || '';
+    document.getElementById('set-wecom').value = s.wecomWebhook || '';
+    document.getElementById('set-bark').value = s.barkUrl || '';
+    document.getElementById('set-sound-repeat').value = String(s.soundRepeat || 3);
+    document.getElementById('sound-clear').hidden = !s.soundUrl;
+    soundRepeat = Number(s.soundRepeat) || 3;
+    soundUrl = s.soundUrl || '';
     settingsMask.hidden = false;
     loadUsage();
   } catch (e) {
@@ -861,6 +976,11 @@ document.getElementById('settings-save').addEventListener('click', async () => {
     offlineKeywords: document.getElementById('set-offline-keywords').value,
     wechatPushEnabled: document.getElementById('set-wechat').checked,
     wechatSendKey: document.getElementById('set-sendkey').value.trim(),
+    pushplusToken: document.getElementById('set-pushplus').value.trim(),
+    dingtalkWebhook: document.getElementById('set-dingtalk').value.trim(),
+    wecomWebhook: document.getElementById('set-wecom').value.trim(),
+    barkUrl: document.getElementById('set-bark').value.trim(),
+    soundRepeat: Math.floor(Number(document.getElementById('set-sound-repeat').value || 3)),
   };
   const newPasscode = document.getElementById('set-passcode').value.trim();
   if (newPasscode) {
@@ -880,6 +1000,9 @@ document.getElementById('settings-save').addEventListener('click', async () => {
     renderAvatarPreview();
     soundEnabled = !!data.soundEnabled;
     agentOnline = !!data.agentOnline;
+    soundRepeat = Number(data.soundRepeat) || soundRepeat;
+    soundUrl = data.soundUrl || soundUrl;
+    document.getElementById('sound-clear').hidden = !soundUrl;
     updateOnlineLabel();
     document.getElementById('sidebar-title').textContent = data.shopName || '客服工作台';
     settingsMask.hidden = true;

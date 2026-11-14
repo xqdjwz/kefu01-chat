@@ -30,6 +30,17 @@ const JSON_HEADERS = {
   'cache-control': 'no-store',
 };
 
+const AUDIO_TYPES = {
+  'audio/mpeg': 'mp3',
+  'audio/mp3': 'mp3',
+  'audio/mp4': 'm4a',
+  'audio/x-m4a': 'm4a',
+  'audio/ogg': 'ogg',
+  'audio/wav': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/aac': 'aac',
+};
+
 const IMAGE_TYPES = {
   'image/jpeg': 'jpg',
   'image/png': 'png',
@@ -83,6 +94,12 @@ const baseSettings = (env) => ({
   contact_prompt: '需要的话可以留下联系方式，方便我们主动联系您',
   wechat_push_enabled: '0',
   wechat_sendkey: '',
+  pushplus_token: '',
+  dingtalk_webhook: '',
+  wecom_webhook: '',
+  bark_url: '',
+  sound_repeat: '3',
+  sound_key: '',
 });
 
 const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: JSON_HEADERS });
@@ -335,7 +352,7 @@ async function handleApi(request, env, url, ctx) {
       ok: true,
       ts: now(),
       version: 'v3-2026-11-14',
-      features: ['avatar', 'geo', 'autoReply', 'sound', 'contact', 'wechatPush', 'export', 'embed'],
+      features: ['avatar', 'geo', 'autoReply', 'sound', 'customSound', 'contact', 'pushMulti', 'export', 'embed'],
       storage: env.BUCKET ? 'r2+d1' : 'd1',
     });
   }
@@ -382,6 +399,7 @@ async function handleApi(request, env, url, ctx) {
   if (path === '/api/avatar/agent' && method === 'GET') return handleAgentAvatar(env);
   if (path === '/api/avatar' && method === 'POST') return handleAvatar(request, env);
   if (path === '/api/avatar/clear' && method === 'POST') return handleAvatarClear(request, env);
+  if (path === '/api/sound' && method === 'POST') return handleSoundUpload(request, env);
   if (path.startsWith('/api/file/') && method === 'GET') return handleFile(env, path.slice('/api/file/'.length));
 
   if (path === '/api/read' && method === 'POST') return handleRead(request, env, url);
@@ -480,6 +498,12 @@ async function handleGetSettings(request, env) {
     soundEnabled: s.sound_enabled === '1',
     wechatPushEnabled: s.wechat_push_enabled === '1',
     wechatSendKey: s.wechat_sendkey || '',
+    pushplusToken: s.pushplus_token || '',
+    dingtalkWebhook: s.dingtalk_webhook || '',
+    wecomWebhook: s.wecom_webhook || '',
+    barkUrl: s.bark_url || '',
+    soundRepeat: Number(s.sound_repeat) || 3,
+    soundUrl: s.sound_key ? '/api/file/' + s.sound_key : '',
   });
 }
 
@@ -528,6 +552,45 @@ async function handleSaveSettings(request, env) {
     if (v && !/^[A-Za-z0-9_-]{6,60}$/.test(v)) return fail('SendKey 格式不正确（应为一串字母数字）', 400, 'bad_sendkey');
     patch.wechat_sendkey = v;
   }
+  const urlOk = (v, prefix) => {
+    if (!v) return true;
+    try {
+      const u = new URL(v);
+      return u.protocol === 'https:' && (!prefix || v.includes(prefix));
+    } catch {
+      return false;
+    }
+  };
+  if (body.pushplusToken !== undefined) {
+    const v = String(body.pushplusToken).trim().slice(0, 60);
+    if (v && !/^[A-Za-z0-9]{6,60}$/.test(v)) return fail('PushPlus token 格式不正确', 400, 'bad_pushplus');
+    patch.pushplus_token = v;
+  }
+  if (body.dingtalkWebhook !== undefined) {
+    const v = String(body.dingtalkWebhook).trim().slice(0, 300);
+    if (!urlOk(v, 'oapi.dingtalk.com')) return fail('钉钉机器人地址不对（应为 https://oapi.dingtalk.com/robot/send?access_token=...）', 400, 'bad_dingtalk');
+    patch.dingtalk_webhook = v;
+  }
+  if (body.wecomWebhook !== undefined) {
+    const v = String(body.wecomWebhook).trim().slice(0, 300);
+    if (!urlOk(v, 'qyapi.weixin.qq.com')) return fail('企业微信机器人地址不对（应为 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...）', 400, 'bad_wecom');
+    patch.wecom_webhook = v;
+  }
+  if (body.barkUrl !== undefined) {
+    const v = String(body.barkUrl).trim().slice(0, 300);
+    if (!urlOk(v, 'api.day.app')) return fail('Bark 地址不对（应为 https://api.day.app/你的Key）', 400, 'bad_bark');
+    patch.bark_url = v;
+  }
+  if (body.soundRepeat !== undefined) {
+    const n = Math.floor(Number(body.soundRepeat));
+    if (!Number.isFinite(n) || n < 1 || n > 5) return fail('提示音次数需在 1～5 之间', 400, 'bad_repeat');
+    patch.sound_repeat = String(n);
+  }
+  if (body.clearSound) {
+    const s0 = await getSettings(env);
+    await removeStoredFile(env, s0.sound_key);
+    patch.sound_key = '';
+  }
   if (body.keywords !== undefined || body.offlineKeywords !== undefined) {
     const build = (input) => {
       if (Array.isArray(input)) {
@@ -567,6 +630,12 @@ async function handleSaveSettings(request, env) {
     soundEnabled: s.sound_enabled === '1',
     wechatPushEnabled: s.wechat_push_enabled === '1',
     wechatSendKey: s.wechat_sendkey || '',
+    pushplusToken: s.pushplus_token || '',
+    dingtalkWebhook: s.dingtalk_webhook || '',
+    wecomWebhook: s.wecom_webhook || '',
+    barkUrl: s.bark_url || '',
+    soundRepeat: Number(s.sound_repeat) || 3,
+    soundUrl: s.sound_key ? '/api/file/' + s.sound_key : '',
   });
 }
 
@@ -987,43 +1056,110 @@ function matchRule(rules, text) {
 
 const pushCooldown = new Map();
 
+const plainOf = (lines) =>
+  lines
+    .join('\n')
+    .replace(/\*\*/g, '');
+
 async function pushWeChat(env, conv, text) {
   const s = await getSettings(env);
   if (s.wechat_push_enabled !== '1') return;
-  const key = String(s.wechat_sendkey || '').trim();
-  if (!key) return;
+
   const last = pushCooldown.get(conv.id) || 0;
   if (now() - last < 5000) return;
   pushCooldown.set(conv.id, now());
 
   const c = parseContact(conv.contact);
+  const contactText = c
+    ? [
+        c.phone && '手机 ' + c.phone,
+        c.wechat && '微信 ' + c.wechat,
+        c.qq && 'QQ ' + c.qq,
+        c.email && '邮箱 ' + c.email,
+      ]
+        .filter(Boolean)
+        .join(' / ')
+    : '';
+
+  const title = '收到新的访客消息';
   const lines = [
     `**访客IP**：${conv.geo_ip || '未知'}`,
     `**位置**：${conv.geo_location || '未知'}`,
     conv.geo_referer ? `**来源**：${conv.geo_referer}` : '',
-    c
-      ? `**联系方式**：${[
-          c.phone && '手机 ' + c.phone,
-          c.wechat && '微信 ' + c.wechat,
-          c.qq && 'QQ ' + c.qq,
-          c.email && '邮箱 ' + c.email,
-        ]
-          .filter(Boolean)
-          .join(' / ')}`
-      : '',
+    contactText ? `**联系方式**：${contactText}` : '',
     `**消息**：${String(text || '').slice(0, 300)}`,
   ].filter(Boolean);
 
-  try {
-    const res = await fetch(`https://sctapi.ftqq.com/${encodeURIComponent(key)}.send`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ title: '收到新的访客消息', desp: lines.join('\n\n') }).toString(),
-    });
-    if (!res.ok) console.warn('wechat push status', res.status);
-  } catch (e) {
-    console.warn('wechat push failed', String(e && e.message));
+  const plain = plainOf(lines);
+  const html = lines.map((l) => l.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')).join('<br>');
+
+  const jobs = [];
+
+  const sendServerChan = String(s.wechat_sendkey || '').trim();
+  if (sendServerChan) {
+    jobs.push(
+      fetch(`https://sctapi.ftqq.com/${encodeURIComponent(sendServerChan)}.send`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ title, desp: lines.join('\n\n') }).toString(),
+      })
+    );
   }
+
+  const pushplus = String(s.pushplus_token || '').trim();
+  if (pushplus) {
+    jobs.push(
+      fetch('https://www.pushplus.plus/send', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token: pushplus, title, content: html, template: 'html' }),
+      })
+    );
+  }
+
+  const ding = String(s.dingtalk_webhook || '').trim();
+  if (ding) {
+    jobs.push(
+      fetch(ding, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          msgtype: 'markdown',
+          markdown: { title, text: lines.join('\n\n') },
+        }),
+      })
+    );
+  }
+
+  const wecom = String(s.wecom_webhook || '').trim();
+  if (wecom) {
+    jobs.push(
+      fetch(wecom, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ msgtype: 'text', text: { content: plain } }),
+      })
+    );
+  }
+
+  const bark = String(s.bark_url || '').trim();
+  if (bark) {
+    const base = bark.replace(/\/+$/, '');
+    const url = `${base}/${encodeURIComponent(title)}/${encodeURIComponent(plain.slice(0, 900))}?group=客服消息`;
+    jobs.push(fetch(url));
+  }
+
+  if (!jobs.length) return;
+
+  await Promise.all(
+    jobs.map((p) =>
+      Promise.resolve(p)
+        .then((res) => {
+          if (!res || !res.ok) console.warn('push status', res && res.status);
+        })
+        .catch((e) => console.warn('push failed', String(e && e.message)))
+    )
+  );
 }
 
 const fmtTime = (ts) => {
@@ -1389,7 +1525,7 @@ async function handleFile(env, encodedKey) {
   } catch {
     return new Response('Not Found', { status: 404 });
   }
-  if (!key || !/^[a-zA-Z0-9-]+\/[a-f0-9]+\.(jpg|png|gif|webp|avif)$/.test(key)) {
+  if (!key || !/^[a-zA-Z0-9-]+\/[a-f0-9]+\.(jpg|png|gif|webp|avif|mp3|m4a|ogg|wav|aac)$/.test(key)) {
     return new Response('Not Found', { status: 404 });
   }
   return serveStoredFile(env, key);
@@ -1432,6 +1568,35 @@ async function handleAvatarClear(request, env) {
   await removeStoredFile(env, s.agent_avatar_key);
   await setSettings(env, { agent_avatar_key: '' });
   return json({ ok: true, avatarUrl: '' });
+}
+
+async function handleSoundUpload(request, env) {
+  const ident = await identify(request, env);
+  if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
+
+  let form;
+  try {
+    form = await request.formData();
+  } catch {
+    return fail('上传数据解析失败，请重试', 400, 'bad_form');
+  }
+  const file = form.get('file');
+  if (!file || typeof file === 'string') return fail('未收到音频文件', 400, 'no_file');
+  if (file.size > 400 * 1024) return fail('提示音文件请小于 400KB（建议截取 2～5 秒）', 413, 'too_large');
+
+  const mime = (file.type || '').toLowerCase();
+  const ext = AUDIO_TYPES[mime];
+  if (!ext) return fail('只支持 MP3 / M4A / OGG / WAV / AAC 音频', 415, 'unsupported_type');
+
+  const buffer = await file.arrayBuffer();
+  const key = `sound/${uid(28)}.${ext}`;
+  const storage = await storeImageBuffer(env, key, mime, buffer);
+  if (storage === 'too_large') return fail('文件偏大，请换小一点的音频', 413, 'too_large_for_d1');
+
+  const s = await getSettings(env);
+  await removeStoredFile(env, s.sound_key);
+  await setSettings(env, { sound_key: key, sound_enabled: '1' });
+  return json({ ok: true, soundUrl: '/api/file/' + key });
 }
 
 async function handleAgentAvatar(env) {

@@ -1553,3 +1553,22 @@ img {
   border-radius: 999px;
   z-index: 100;
 }
+
+/* 提示音设置行 */
+.sound-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 4px;
+  flex-wrap: wrap;
+}
+.sound-count {
+  width: 72px !important;
+  flex: 0 0 auto;
+  padding: 8px 10px;
+  font-size: 13px;
+}
+.sound-row .btn-ghost {
+  font-size: 13px;
+  padding: 8px 12px;
+}
