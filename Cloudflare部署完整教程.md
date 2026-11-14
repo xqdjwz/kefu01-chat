@@ -43,11 +43,11 @@ Workers 用一行 `[assets]` 配置就把静态文件和接口合到一个域名
 
 1. 注册并登陆 [GitHub](https://github.com/)
 2. 访问 https://github.com/xqdjwz/kefu01-chat/，Fork项目到自己仓库
-3. 注册并登陆 [Cloudflare](https://dash.cloudflare.com/login/)，
-4. Cloudflare 建 D1 库 `cf_kefu`，复制 Database ID（第 6 步）
-5. 在 GitHub 网页把 `wrangler.toml` 里那行占位符换成 Database ID（第 7 步）
-6. Cloudflare 里 Import 仓库，构建 `npm install`、部署 `npx wrangler deploy`（第 8 步）
-7. 打开 `/agent`，第一次输入名称+口令就完成初始化（第 10 步）
+4. 注册并登陆 [Cloudflare](https://dash.cloudflare.com/login/)，
+5. Cloudflare 建 D1 库 `cf_kefu`，复制 Database ID（第 6 步）
+6. 在 GitHub 网页把 `wrangler.toml` 里那行占位符换成 Database ID（第 7 步）
+7. Cloudflare 里 Import 仓库，构建 `npm install`、部署 `npx wrangler deploy`（第 8 步）
+8. 打开 `/agent`，第一次输入名称+口令就完成初始化（第 10 步）
 
 预计 15～20 分钟，第一次部署构建 1～3 分钟。
 
@@ -55,8 +55,9 @@ Workers 用一行 `[assets]` 配置就把静态文件和接口合到一个域名
 
 ## 1. 获取项目
 1. 注册并登陆 [GitHub](https://github.com/)
-2. 访问 https://github.com/xqdjwz/kefu01-chat/，Fork项目到自己仓库
-3. 注册并登陆 [Cloudflare](https://dash.cloudflare.com/login/)，
+2. 访问项目地址 https://github.com/xqdjwz/kefu01-chat/
+3. 项目右上角点击 Fork 
+4. 注册并登陆 [Cloudflare](https://dash.cloudflare.com/login/)，
 
 ## 2. 创建 D1 数据库
 
