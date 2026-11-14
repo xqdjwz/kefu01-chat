@@ -2,7 +2,8 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
 <title>在线客服</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/assets/app.css">
@@ -19,12 +20,33 @@
         <div class="chat-head-title" id="shop-name">在线客服</div>
         <div class="chat-head-sub">
           <span class="status-dot" aria-hidden="true"></span>
-          <span>客服在线 · 通常几分钟内回复</span>
+          <span>在线 · 留言后客服会尽快回复</span>
         </div>
       </div>
+      <button class="head-link" id="contact-open" type="button" hidden>留联系方式</button>
     </header>
 
-    <div id="chat-host" class="chat-host"></div>
+    <div class="contact-panel" id="contact-panel" hidden>
+      <div class="contact-head">
+        <span>留下联系方式，方便我们主动联系您（都可以不填）</span>
+        <button class="contact-close" id="contact-close" type="button" aria-label="收起">✕</button>
+      </div>
+      <div class="contact-grid">
+        <input class="field-input" id="c-phone" maxlength="20" placeholder="手机号">
+        <input class="field-input" id="c-wechat" maxlength="40" placeholder="微信号">
+        <input class="field-input" id="c-qq" maxlength="20" placeholder="QQ号">
+        <input class="field-input" id="c-email" maxlength="60" placeholder="邮箱">
+      </div>
+      <div class="contact-foot">
+        <button class="btn-primary contact-save" id="contact-save" type="button">提交</button>
+        <span class="contact-note">仅用于客服联系，不会外泄</span>
+      </div>
+      <div class="login-error" id="contact-error"></div>
+    </div>
+
+    <div id="chat-host" class="chat-host">
+      <div class="chat-empty"><p>正在连接客服…</p></div>
+    </div>
   </div>
 
   <noscript>
@@ -35,7 +57,28 @@
 import { createChatHost } from '/assets/chat.js';
 
 const TOKEN_KEY = 'kefu_visitor_token';
+
+// 被别的网站用 iframe 嵌入时，浏览器可能禁掉 localStorage，这里做内存兜底
+const memStore = {};
+const store = {
+  get(key) {
+    try {
+      return localStorage.getItem(key) || '';
+    } catch {
+      return memStore[key] || '';
+    }
+  },
+  set(key, value) {
+    try {
+      localStorage.setItem(key, value);
+    } catch {
+      memStore[key] = value;
+    }
+  },
+};
 const host = document.getElementById('chat-host');
+let visitorToken = '';
+let contactEnabled = false;
 
 function showError(message) {
   host.innerHTML = `
@@ -47,19 +90,49 @@ function showError(message) {
   if (btn) btn.addEventListener('click', () => location.reload());
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function refFromQuery() {
+  try {
+    return new URLSearchParams(location.search).get('ref') || '';
+  } catch {
+    return '';
+  }
+}
+
+async function createSession() {
+  let lastError = null;
+  for (let i = 0; i < 3; i++) {
+    try {
+      const res = await fetch('/api/session', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          token: store.get(TOKEN_KEY),
+          referer: refFromQuery() || document.referrer || location.href,
+        }),
+        cache: 'no-store',
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.message || `连接失败（${res.status}）`);
+      return data;
+    } catch (e) {
+      lastError = e;
+      if (i < 2) await sleep(800 * (i + 1));
+    }
+  }
+  throw lastError || new Error('连接失败');
+}
+
 async function boot() {
   try {
-    const token = localStorage.getItem(TOKEN_KEY) || '';
-    const res = await fetch('/api/session', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token }),
-    });
-    if (!res.ok) throw new Error('无法建立会话');
-    const data = await res.json();
-
-    localStorage.setItem(TOKEN_KEY, data.token);
+    const data = await createSession();
+    store.set(TOKEN_KEY, data.token);
     if (data.shop) document.getElementById('shop-name').textContent = data.shop;
+
+    visitorToken = data.token;
+    contactEnabled = !!data.contactEnabled;
+    document.getElementById('contact-open').hidden = !contactEnabled;
 
     host.innerHTML = '';
     createChatHost({
@@ -67,12 +140,59 @@ async function boot() {
       role: 'visitor',
       token: data.token,
       convId: data.conv.id,
-      emptyText: '您好，有任何问题都可以在这里留言，客服会尽快回复',
+      peerAvatarUrl: '/api/avatar/agent',
+      emptyText: '您好，有任何问题都可以在这里留言，客服会尽快回复（支持图片和表情）',
     });
   } catch (e) {
-    showError('网络连接失败，请稍后重试');
+    showError(e.message || '网络连接失败，请稍后重试');
   }
 }
+
+const contactPanel = document.getElementById('contact-panel');
+const contactError = document.getElementById('contact-error');
+
+document.getElementById('contact-open').addEventListener('click', () => {
+  contactPanel.hidden = !contactPanel.hidden;
+});
+
+document.getElementById('contact-close').addEventListener('click', () => {
+  contactPanel.hidden = true;
+});
+
+document.getElementById('contact-save').addEventListener('click', async () => {
+  contactError.style.display = 'none';
+  const payload = {
+    phone: document.getElementById('c-phone').value.trim(),
+    wechat: document.getElementById('c-wechat').value.trim(),
+    qq: document.getElementById('c-qq').value.trim(),
+    email: document.getElementById('c-email').value.trim(),
+  };
+  const btn = document.getElementById('contact-save');
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/contact', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-visitor-token': visitorToken },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.message || `提交失败（${res.status}）`);
+    contactPanel.hidden = true;
+    ['c-phone', 'c-wechat', 'c-qq', 'c-email'].forEach((id) => {
+      document.getElementById(id).value = '';
+    });
+    const ok = document.createElement('div');
+    ok.className = 'contact-toast';
+    ok.textContent = '已收到您的联系方式，客服会尽快联系您';
+    document.body.appendChild(ok);
+    setTimeout(() => ok.remove(), 2600);
+  } catch (e) {
+    contactError.textContent = e.message;
+    contactError.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 boot();
 </script>
