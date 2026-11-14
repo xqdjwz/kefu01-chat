@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>客服工作台</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body class="page-agent">
+
+  <!-- ===== 登录 ===== -->
+  <div class="login-wrap" id="login-view">
+    <div class="login-card">
+      <div class="mark-lg" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 11.5a8.4 8.4 0 01-9 8.4 9 9 0 01-3.8-.9L3 20l1.1-3.3A8.4 8.4 0 0112 3.1a8.4 8.4 0 019 8.4z"/>
+        </svg>
+      </div>
+      <h1>客服工作台</h1>
+      <p class="lead">输入部署时设置的客服口令，即可查看并回复所有访客消息。</p>
+      <form id="login-form" autocomplete="on">
+        <input type="text" name="username" value="agent" autocomplete="username" hidden>
+        <label class="field-label" for="token-input">客服口令</label>
+        <input class="field-input" id="token-input" name="token" type="password" autocomplete="current-password" placeholder="请输入 AGENT_TOKEN">
+        <button class="btn-primary" id="login-btn" type="submit">进入工作台</button>
+      </form>
+      <div class="login-error" id="login-error"></div>
+    </div>
+  </div>
+
+  <!-- ===== 工作台 ===== -->
+  <div class="agent-app" id="app-view" hidden>
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <div class="mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 11.5a8.4 8.4 0 01-9 8.4 9 9 0 01-3.8-.9L3 20l1.1-3.3A8.4 8.4 0 0112 3.1a8.4 8.4 0 019 8.4z"/>
+          </svg>
+        </div>
+        <div>
+          <div class="sidebar-head-title" id="sidebar-title">客服工作台</div>
+          <div class="sidebar-head-sub"><span id="conv-count">0</span> 个会话 · 消息实时同步</div>
+        </div>
+      </div>
+
+      <div class="sidebar-tools">
+        <div class="search-box">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/>
+          </svg>
+          <input id="search-input" type="search" placeholder="搜索访客名称或消息" aria-label="搜索会话">
+        </div>
+      </div>
+
+      <div class="conv-list" id="conv-list"></div>
+
+      <div class="sidebar-foot">
+        <a class="text-link" href="/" target="_blank" rel="noopener">打开访客端 →</a>
+        <a class="text-link" href="#" id="logout">退出登录</a>
+      </div>
+    </aside>
+
+    <main class="agent-pane">
+      <header class="agent-pane-head" id="pane-head">
+        <button class="back-btn" id="back-btn" type="button" aria-label="返回会话列表">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>
+        </button>
+        <div class="pane-titles">
+          <div class="pane-name" id="pane-name">未选择会话</div>
+          <div class="pane-sub" id="pane-sub">从左侧选择一个访客会话</div>
+        </div>
+        <button class="rename-btn" id="btn-rename" type="button" title="修改访客备注" aria-label="修改访客备注" hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+        </button>
+      </header>
+
+      <div class="pane-empty" id="pane-empty">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 11.5a8.4 8.4 0 01-9 8.4 9 9 0 01-3.8-.9L3 20l1.1-3.3A8.4 8.4 0 0112 3.1a8.4 8.4 0 019 8.4z"/>
+        </svg>
+        <p>选择左侧会话开始回复<br>支持文字、图片、撤回与已读回执</p>
+      </div>
+
+      <div id="agent-chat-host" class="chat-host" hidden></div>
+    </main>
+  </div>
+
+<script type="module">
+import { createChatHost, toast } from '/assets/chat.js';
+
+const TOKEN_KEY = 'kefu_agent_token';
+const loginView = document.getElementById('login-view');
+const appView = document.getElementById('app-view');
+const tokenInput = document.getElementById('token-input');
+const loginBtn = document.getElementById('login-btn');
+const loginError = document.getElementById('login-error');
+const convList = document.getElementById('conv-list');
+const chatHost = document.getElementById('agent-chat-host');
+const paneEmpty = document.getElementById('pane-empty');
+const paneName = document.getElementById('pane-name');
+const paneSub = document.getElementById('pane-sub');
+const searchInput = document.getElementById('search-input');
+const renameBtn = document.getElementById('btn-rename');
+
+let agentToken = '';
+let agentName = '客服';
+let conversations = [];
+let activeId = null;
+let chat = null;
+let listTimer = null;
+
+const keyOf = (id) => `kefu_agent_view_${id}`;
+
+function fmtListTime(ts) {
+  const d = new Date(ts);
+  const t = new Date();
+  if (d.toDateString() === t.toDateString()) {
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  }
+  return `${d.getMonth() + 1}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function headers(json = false) {
+  return json
+    ? { authorization: `Bearer ${agentToken}`, 'content-type': 'application/json' }
+    : { authorization: `Bearer ${agentToken}` };
+}
+
+async function api(path, init = {}) {
+  const res = await fetch(path, { ...init, headers: headers(!!init.body) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.message || `请求失败（${res.status}）`);
+  return data;
+}
+
+/* ------------------------------ 登录 ------------------------------ */
+
+async function login(token) {
+  loginBtn.disabled = true;
+  loginError.style.display = 'none';
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.message || '登录失败');
+
+    agentToken = token;
+    agentName = data.name || '客服';
+    localStorage.setItem(TOKEN_KEY, token);
+    document.getElementById('sidebar-title').textContent = data.shop ? `${data.shop} · 工作台` : '客服工作台';
+    enterApp();
+  } catch (e) {
+    loginError.textContent = e.message;
+    loginError.style.display = 'block';
+    localStorage.removeItem(TOKEN_KEY);
+  } finally {
+    loginBtn.disabled = false;
+  }
+}
+
+document.getElementById('login-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const v = tokenInput.value.trim();
+  if (!v) {
+    loginError.textContent = '请输入客服口令';
+    loginError.style.display = 'block';
+    return;
+  }
+  login(v);
+});
+
+function enterApp() {
+  loginView.hidden = true;
+  appView.hidden = false;
+
+  chat = createChatHost({
+    root: chatHost,
+    role: 'agent',
+    token: agentToken,
+    convId: null,
+    emptyText: '从左侧选择一个会话',
+    onMeta: (conv) => {
+      const item = conversations.find((c) => c.id === conv.id);
+      if (item) {
+        item.unread = conv.unread;
+        renderList();
+      }
+    },
+  });
+
+  loadConversations();
+  clearInterval(listTimer);
+  listTimer = setInterval(loadConversations, 5000);
+}
+
+/* ------------------------------ 会话列表 ------------------------------ */
+
+async function loadConversations() {
+  try {
+    const data = await api('/api/conversations');
+    conversations = data.conversations || [];
+    document.getElementById('conv-count').textContent = String(conversations.length);
+    renderList();
+  } catch (e) {
+    if (String(e.message).includes('未登录')) logout();
+  }
+}
+
+let lastListSig = '';
+
+function renderList(force = false) {
+  const keyword = searchInput.value.trim().toLowerCase();
+  const list = conversations.filter(
+    (c) => !keyword || c.name.toLowerCase().includes(keyword) || c.preview.toLowerCase().includes(keyword)
+  );
+
+  // 只有数据真的变了才重建 DOM，避免轮询导致的闪烁与点击失效
+  const sig =
+    list.map((c) => `${c.id}:${c.unread}:${c.lastMessageAt}:${c.preview}`).join('|') +
+    `#${keyword}#${activeId}`;
+  if (!force && sig === lastListSig) return;
+  lastListSig = sig;
+
+  if (!list.length) {
+    convList.innerHTML = `<div style="padding:28px 16px;color:rgba(255,255,255,.4);font-size:12.5px;text-align:center">${
+      conversations.length ? '没有匹配的会话' : '暂无访客会话'
+    }</div>`;
+    return;
+  }
+
+  convList.innerHTML = '';
+  for (const c of list) {
+    const item = document.createElement('div');
+    item.className = 'conv-item' + (c.id === activeId ? ' active' : '');
+    item.dataset.id = c.id;
+
+    const av = document.createElement('div');
+    av.className = 'conv-avatar';
+    av.textContent = (c.name || '访').slice(0, 1);
+
+    const body = document.createElement('div');
+    body.className = 'conv-body';
+    const name = document.createElement('div');
+    name.className = 'conv-name';
+    name.textContent = c.name || '访客';
+    const preview = document.createElement('div');
+    preview.className = 'conv-preview';
+    preview.textContent = c.preview || '暂无消息';
+    body.append(name, preview);
+
+    const side = document.createElement('div');
+    side.className = 'conv-side';
+    const time = document.createElement('span');
+    time.className = 'conv-time';
+    time.textContent = fmtListTime(c.lastMessageAt || c.createdAt);
+    side.appendChild(time);
+    if (c.unread > 0) {
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = c.unread > 99 ? '99+' : String(c.unread);
+      side.appendChild(badge);
+    }
+
+    item.append(av, body, side);
+    item.setAttribute('role', 'button');
+    item.tabIndex = 0;
+    item.setAttribute('aria-label', `打开与 ${c.name || '访客'} 的会话`);
+    item.addEventListener('click', () => openConversation(c));
+    item.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        openConversation(c);
+      }
+    });
+    convList.appendChild(item);
+  }
+}
+
+/* ------------------------------ 打开会话 ------------------------------ */
+
+function openConversation(c) {
+  activeId = c.id;
+  paneEmpty.hidden = true;
+  chatHost.hidden = false;
+  renameBtn.hidden = false;
+
+  const preview = (c.preview || '').replace(/^客服[:：]\s*/, '');
+  paneName.textContent = c.name || '访客';
+  paneSub.textContent = preview ? `最近：${preview}` : '暂无消息';
+
+  appView.classList.add('mobile-open');
+  renderList();
+  chat.setConv(c.id);
+}
+
+/* ------------------------------ 修改备注 ------------------------------ */
+
+renameBtn.addEventListener('click', async () => {
+  if (!activeId) {
+    toast('请先选择会话');
+    return;
+  }
+  const cur = conversations.find((c) => c.id === activeId);
+  const current = cur ? cur.name : '';
+  const next = prompt('修改访客备注：', current);
+  if (next === null) return;
+  const trimmed = next.trim();
+  if (!trimmed) {
+    toast('备注不能为空');
+    return;
+  }
+  try {
+    await api(`/api/conversations/${activeId}/rename`, {
+      method: 'POST',
+      body: JSON.stringify({ name: trimmed }),
+    });
+    if (cur) cur.name = trimmed;
+    paneName.textContent = trimmed;
+    renderList(true);
+    toast('备注已更新');
+  } catch (e) {
+    toast(e.message);
+  }
+});
+
+document.getElementById('back-btn').addEventListener('click', () => {
+  appView.classList.remove('mobile-open');
+});
+
+searchInput.addEventListener('input', renderList);
+
+/* ------------------------------ 退出 ------------------------------ */
+
+async function logout() {
+  clearInterval(listTimer);
+  localStorage.removeItem(TOKEN_KEY);
+  if (chat) chat.destroy();
+  location.reload();
+}
+document.getElementById('logout').addEventListener('click', (e) => {
+  e.preventDefault();
+  logout();
+});
+
+/* ------------------------------ 启动 ------------------------------ */
+
+const saved = localStorage.getItem(TOKEN_KEY);
+if (saved) login(saved);
+else tokenInput.focus();
+</script>
+</body>
+</html>
