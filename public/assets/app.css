@@ -335,9 +335,8 @@ img {
   gap: 6px;
   font-size: 11px;
   color: var(--muted);
-  margin: 3px 2px 0;
-  min-height: 20px;
-  align-items: center;
+  margin: 4px 2px 0;
+  height: 16px;
 }
 
 .msg.me .msg-meta {
@@ -360,23 +359,37 @@ img {
   height: 12px;
 }
 
-/* 消息操作按钮：放在时间行里，手机端也不会被屏幕边缘裁掉 */
+/* 消息操作按钮 */
 .msg-actions {
-  display: inline-flex;
-  align-items: center;
-  opacity: 0.55;
+  position: absolute;
+  bottom: 20px;
+  opacity: 0;
   transition: opacity 0.15s;
   z-index: 3;
 }
 
-.msg:hover .msg-actions,
-.msg:focus-within .msg-actions {
-  opacity: 1;
+.msg.me .msg-actions {
+  right: calc(100% + 6px);
+}
+.msg.other .msg-actions {
+  left: calc(100% + 6px);
+}
+
+@media (hover: hover) {
+  .msg:hover .msg-actions {
+    opacity: 1;
+  }
+}
+
+@media (hover: none) {
+  .msg-actions {
+    opacity: 0.55;
+  }
 }
 
 .btn-dots {
-  width: 18px;
-  height: 18px;
+  width: 26px;
+  height: 26px;
   border-radius: 50%;
   display: grid;
   place-items: center;
@@ -388,8 +401,8 @@ img {
   color: var(--ink-2);
 }
 .btn-dots svg {
-  width: 13px;
-  height: 13px;
+  width: 15px;
+  height: 15px;
 }
 
 .pop-menu {
@@ -1023,389 +1036,4 @@ img {
   * {
     transition-duration: 0.01ms !important;
   }
-}
-
-/* ============================================================
-   2025 修复版新增：表情面板 / 弹窗 / 备注 / 在线状态
-   ============================================================ */
-
-.sidebar-head-titles {
-  min-width: 0;
-  flex: 1;
-}
-
-/* 表情面板 */
-.emoji-panel {
-  max-width: 940px;
-  margin: 0 auto 8px;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  padding: 10px;
-  display: grid;
-  grid-template-columns: repeat(10, 1fr);
-  gap: 4px;
-  box-shadow: var(--shadow-md);
-  max-height: 208px;
-  overflow-y: auto;
-}
-
-.emoji-item {
-  font-size: 20px;
-  line-height: 1;
-  padding: 6px 0;
-  border-radius: 8px;
-  transition: background 0.12s, transform 0.12s;
-}
-.emoji-item:hover {
-  background: var(--accent-soft);
-}
-.emoji-item:active {
-  transform: scale(0.9);
-}
-
-@media (max-width: 480px) {
-  .emoji-panel {
-    grid-template-columns: repeat(8, 1fr);
-  }
-}
-
-/* 纯表情消息显示大一点 */
-.bubble.emoji-bubble {
-  font-size: 30px;
-  line-height: 1.25;
-  padding: 6px 12px;
-  background: transparent;
-  border-color: transparent;
-  box-shadow: none;
-}
-.msg.me .bubble.emoji-bubble {
-  background: transparent;
-  box-shadow: none;
-}
-
-.img-cap {
-  font-size: 13px;
-  padding: 5px 6px 2px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-/* 备注标签 / 在线小绿点 */
-.remark-tag {
-  font-size: 10px;
-  font-weight: 400;
-  color: var(--accent);
-  background: var(--accent-soft);
-  border-radius: 4px;
-  padding: 1px 4px;
-  flex: 0 0 auto;
-}
-
-.online-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: #34d399;
-  flex: 0 0 auto;
-  box-shadow: 0 0 0 2px rgba(52, 211, 153, 0.2);
-}
-
-.conv-empty {
-  padding: 28px 16px;
-  color: rgba(255, 255, 255, 0.4);
-  font-size: 12.5px;
-  text-align: center;
-  line-height: 1.8;
-}
-
-/* 侧栏文字按钮（原来只有 a 标签样式，这里补 button） */
-.text-link {
-  padding: 0;
-  border: none;
-  background: none;
-  font-family: inherit;
-  cursor: pointer;
-}
-
-/* 弹窗 */
-.modal-mask {
-  position: fixed;
-  inset: 0;
-  background: rgba(10, 12, 15, 0.55);
-  display: grid;
-  place-items: center;
-  padding: 20px;
-  z-index: 70;
-  overflow-y: auto;
-}
-.modal-mask[hidden] {
-  display: none;
-}
-
-.modal {
-  width: 100%;
-  max-width: 440px;
-  background: var(--surface);
-  border-radius: 16px;
-  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.4);
-  display: flex;
-  flex-direction: column;
-  max-height: calc(100dvh - 40px);
-  overflow: hidden;
-}
-.modal-sm {
-  max-width: 380px;
-}
-
-.modal-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 16px 18px 10px;
-}
-.modal-head h2 {
-  font-size: 16px;
-  margin: 0;
-  font-weight: 600;
-}
-
-.modal-close {
-  width: 30px;
-  height: 30px;
-  border-radius: 8px;
-  color: var(--muted);
-  font-size: 15px;
-  display: grid;
-  place-items: center;
-}
-.modal-close:hover {
-  background: var(--surface-soft);
-  color: var(--ink);
-}
-
-.modal-body {
-  padding: 4px 18px 6px;
-  overflow-y: auto;
-}
-
-.modal-tip {
-  font-size: 12.5px;
-  color: var(--muted);
-  line-height: 1.6;
-  margin: 0 0 12px;
-}
-
-.modal-foot {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 12px 18px 16px;
-}
-
-.btn-ghost {
-  padding: 10px 14px;
-  border-radius: 10px;
-  font-size: 14px;
-  color: var(--ink-2);
-  background: var(--surface-soft);
-  border: 1px solid var(--line);
-}
-.btn-ghost:hover {
-  background: var(--line);
-}
-.btn-ghost.danger {
-  color: var(--accent-deep);
-  border-color: #f7d3c7;
-  background: var(--accent-soft);
-}
-
-.modal-save {
-  width: auto;
-  margin-top: 0;
-  padding: 10px 18px;
-  font-size: 14px;
-}
-
-.field-textarea {
-  resize: vertical;
-  min-height: 74px;
-  line-height: 1.55;
-  font-size: 15px;
-}
-
-/* 开关 */
-.switch-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  padding: 12px 0 4px;
-  border-top: 1px solid var(--line);
-}
-.switch-title {
-  font-size: 13.5px;
-  font-weight: 500;
-}
-.switch-desc {
-  font-size: 11.5px;
-  color: var(--muted);
-  margin-top: 2px;
-  line-height: 1.5;
-}
-
-.switch {
-  position: relative;
-  display: inline-flex;
-  flex: 0 0 auto;
-  cursor: pointer;
-}
-.switch input {
-  position: absolute;
-  opacity: 0;
-  width: 0;
-  height: 0;
-}
-.switch-track {
-  width: 44px;
-  height: 25px;
-  border-radius: 999px;
-  background: var(--line-strong);
-  display: inline-flex;
-  align-items: center;
-  padding: 2px;
-  transition: background 0.18s;
-}
-.switch-thumb {
-  width: 21px;
-  height: 21px;
-  border-radius: 50%;
-  background: #fff;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
-  transition: transform 0.18s;
-}
-.switch input:checked + .switch-track {
-  background: var(--accent);
-}
-.switch input:checked + .switch-track .switch-thumb {
-  transform: translateX(19px);
-}
-
-/* 存储用量面板 */
-.usage-block {
-  margin-top: 18px;
-  padding-top: 14px;
-  border-top: 1px solid var(--line);
-}
-.usage-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 13.5px;
-  font-weight: 600;
-  color: var(--ink);
-  margin-bottom: 8px;
-}
-.usage-bar {
-  height: 8px;
-  border-radius: 6px;
-  background: var(--line);
-  overflow: hidden;
-}
-.usage-bar span {
-  display: block;
-  height: 100%;
-  width: 0;
-  border-radius: 6px;
-  background: linear-gradient(90deg, var(--accent), var(--accent-deep));
-  transition: width 0.3s ease;
-}
-.usage-line {
-  margin-top: 8px;
-  font-size: 13px;
-  color: var(--ink-2);
-  line-height: 1.5;
-}
-.usage-sub {
-  margin-top: 4px;
-  font-size: 12.5px;
-  color: var(--muted);
-  line-height: 1.55;
-}
-.usage-row {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-}
-.usage-row .field-input {
-  flex: 1;
-  min-width: 0;
-  text-align: center;
-}
-.usage-note {
-  margin-top: 8px;
-  font-size: 12px;
-  color: var(--muted);
-  line-height: 1.6;
-}
-
-/* 消息名称标签 */
-.msg-name {
-  font-size: 11px;
-  color: var(--muted);
-  margin: 0 2px 4px;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.msg.me .msg-name {
-  text-align: right;
-}
-
-/* 头像图片 */
-.avatar-sm img.avatar-img {
-  width: 100%;
-  height: 100%;
-  border-radius: inherit;
-  object-fit: cover;
-  display: block;
-}
-
-/* 设置里的头像预览 */
-.avatar-row {
-  display: flex;
-  gap: 12px;
-  align-items: flex-start;
-  margin-top: 14px;
-}
-.avatar-preview {
-  width: 48px;
-  height: 48px;
-  border-radius: 12px;
-  background: var(--accent-soft);
-  border: 1px solid var(--line, #e5e9f0);
-  display: grid;
-  place-items: center;
-  font-size: 16px;
-  color: var(--accent-deep);
-  overflow: hidden;
-  flex: 0 0 auto;
-}
-.avatar-preview img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
-.avatar-actions {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  min-width: 0;
-}
-.avatar-hint {
-  font-size: 12px;
-  color: var(--muted);
 }

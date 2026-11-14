@@ -2,8 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#ffffff">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>在线客服</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/assets/app.css">
@@ -20,14 +19,12 @@
         <div class="chat-head-title" id="shop-name">在线客服</div>
         <div class="chat-head-sub">
           <span class="status-dot" aria-hidden="true"></span>
-          <span>在线 · 留言后客服会尽快回复</span>
+          <span>客服在线 · 通常几分钟内回复</span>
         </div>
       </div>
     </header>
 
-    <div id="chat-host" class="chat-host">
-      <div class="chat-empty"><p>正在连接客服…</p></div>
-    </div>
+    <div id="chat-host" class="chat-host"></div>
   </div>
 
   <noscript>
@@ -50,32 +47,17 @@ function showError(message) {
   if (btn) btn.addEventListener('click', () => location.reload());
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function createSession() {
-  let lastError = null;
-  for (let i = 0; i < 3; i++) {
-    try {
-      const res = await fetch('/api/session', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ token: localStorage.getItem(TOKEN_KEY) || '' }),
-        cache: 'no-store',
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.message || `连接失败（${res.status}）`);
-      return data;
-    } catch (e) {
-      lastError = e;
-      if (i < 2) await sleep(800 * (i + 1));
-    }
-  }
-  throw lastError || new Error('连接失败');
-}
-
 async function boot() {
   try {
-    const data = await createSession();
+    const token = localStorage.getItem(TOKEN_KEY) || '';
+    const res = await fetch('/api/session', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
+    if (!res.ok) throw new Error('无法建立会话');
+    const data = await res.json();
+
     localStorage.setItem(TOKEN_KEY, data.token);
     if (data.shop) document.getElementById('shop-name').textContent = data.shop;
 
@@ -85,11 +67,10 @@ async function boot() {
       role: 'visitor',
       token: data.token,
       convId: data.conv.id,
-      peerAvatarUrl: '/api/avatar/agent',
-      emptyText: '您好，有任何问题都可以在这里留言，客服会尽快回复（支持图片和表情）',
+      emptyText: '您好，有任何问题都可以在这里留言，客服会尽快回复',
     });
   } catch (e) {
-    showError(e.message || '网络连接失败，请稍后重试');
+    showError('网络连接失败，请稍后重试');
   }
 }
 
