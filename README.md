@@ -1,6 +1,8 @@
 # 在线客服聊天系统（Workers + D1）
 
 访客端和客服工作台在同一个域名下，纯 Cloudflare 免费额度就能跑：**Workers（计算）+ D1（数据库）+ 静态资源**。图片默认也存 D1，配置 R2 后自动改用 R2。
+项目：cf-kefu-chat 架构：Cloudflare Workers（计算）+ D1（数据库）+ R2（图片存储）+ 原生 HTML/CSS/JS（前端） 成本：全套跑在 Cloudflare 免费额度内，无需服务器、无需 VPS、无需数据库服务器
+
 
 ![访客端](docs/preview-visitor.png)
 ![客服工作台](docs/preview-agent.png)
@@ -53,14 +55,21 @@ cf-kefu-chat/
 └── docs/                          # 预览截图
 ```
 
+组件	作用	免费额度	本项目里叫什么
+Workers	跑后端代码 + 托管前端页面	10 万请求/天	Worker 名 kefu-chat
+D1	SQLite 数据库，存会话和消息	5 GB 总容量 / 单库 500 MB；5 百万行读 / 10 万行写（每天）	库名 kefu_db
+R2	对象存储，存聊天图片	10 GB 存储，读取不收流量费	桶名 kefu-files
+
+
 ## 部署（不需要任何命令行）
 
-1. **建 D1 数据库**：Cloudflare 控制台 → Storage & Databases → D1 SQL Database → Create database，名称 `cf_kefu`，创建后复制 `Database ID`。
-2. **传代码到 GitHub**：新建仓库，把本项目所有文件（保持目录结构）上传提交。
-3. **填 database_id**：在 GitHub 打开 `wrangler.toml`，把 `REPLACE_WITH_YOUR_D1_DATABASE_ID` 替换成第 1 步的 ID，提交。
-4. **连自动部署**：Cloudflare 控制台 → Workers & Pages → Create → Workers → Import a repository → 选这个仓库；构建命令 `npm install`，部署命令 `npx wrangler deploy` → 部署。
-5. 打开输出的 `https://cf-kefu-chat.xxx.workers.dev`（访客端），`/agent` 是客服端。**第一次登录时输入的口令会自动成为系统口令。**
-
+1.**注册登陆GitHub账户**；访问项目地址 https://github.com/xqdjwz/kefu01-chat/，✨Star，右上角点击 Fork 到自己账户，
+2.**注册登陆Cloudflare账户**；https://dash.cloudflare.com/login，不会使用的访问 https://xqdj.pp.ua/guide
+3. **建 D1 数据库**：Cloudflare 控制台 → Storage & Databases → D1 SQL Database → Create database，名称 `kefu_db`，创建后复制 `Database ID`。
+4. **建 R2 存储桶**：名称kefu-files，复制名称，粘贴到 wrangler.toml 第21行
+5. **填数据库ID**：在 GitHub 打开 `wrangler.toml`，把第15行 `REPLACE_WITH_YOUR_D1_DATABASE_ID` 替换成自己的数据库 ID，提交。
+5. **创建workers应用程序**：Cloudflare 控制台 → Workers & Pages → Create → Workers → Import a repository → 选这个仓库；构建命令 `npm install`，部署命令 `npx wrangler deploy` → 部署。
+6. 部署好后，打开输出的 `https://cf-kefu-chat.xxx.workers.dev`（访客端），`/agent` 是客服端。**第一次登录时输入的口令会自动成为系统口令。**
 > 数据表由 Worker 首次请求时自动创建，不需要执行 `wrangler d1 migrations apply`。
 
 ## 改配置
@@ -105,6 +114,29 @@ cf-kefu-chat/
 - **客服账号**：目前是「共享口令 + 自定义名称」，多客服可同时登录，消息按各自名称署名。
 - **数据**：都在你的 D1 里，可在控制台用 SQL 直接查。
 
+## 当前占用多大？剩余空间查看；
+方案 1：D1 控制台查看（最准，推荐）
+1. 进入 Cloudflare 后台 → D1 → 你的数据库名称
+2. 在概览页直接看：概述-已用储存（当前）查看用了多少，这是官方真实占用（包含表、索引）
+3. 索引也会吃掉一部分空间，实际容量会比单纯文本估算更大
+方案 2：SQL 统计行数，用来粗略估算容量
+执行这条，拿到会话总数、消息总数：
+SELECT
+  (SELECT COUNT(*) FROM conversations) AS 会话数量,
+  (SELECT COUNT(*) FROM messages) AS 消息数量;
+估算公式（按单条消息～200 byte，会话一条～250 byte）： 总字节 ≈ 会话数 × 250 + 消息数 × 200
+方案 3：查看所有表占用（D1 支持，统计页面行数）
+SELECT 'conversations' AS table_name, COUNT(*) AS rows FROM conversations
+UNION ALL
+SELECT 'messages' AS table_name, COUNT(*) AS rows FROM messages
+UNION ALL
+SELECT 'd1_migrations' AS table_name, COUNT(*) AS rows FROM d1_migrations;
+补充
+* 免费单库硬上限：500 MB
+* 索引也会吃掉一部分空间，实际容量会比单纯文本估算更大
+* 如果后面行数涨到几十万，建议开启咱们上面的 7 天自动清理
+
+
 ## 已验证
 
 本地用 node:sqlite 模拟 D1 + Chromium 跑了完整回归：55 项接口断言（建会话、欢迎语、登录首设口令、错误口令、未读计数、已读回写、增量同步、撤回权限与超时、单侧删除、图片上传读回、备注、改名、设置、越权拦截、超长/空消息）与 37 项浏览器交互用例（文字/表情/图片发送、双端 2 秒内同步、已读回执、撤回提示、删除单侧生效、备注、设置保存、手机端布局、刷新保持登录）全部通过。
@@ -115,3 +147,6 @@ cf-kefu-chat/
 - 完整版本记录见仓库根目录 [`CHANGELOG.md`](../CHANGELOG.md)
 - 升级步骤见 [`升级说明.md`](../升级说明.md)
 - 判断线上版本：`GET /api/health`，看 `version` 是否为 `v3.3-2026-11-21`
+
+
+
