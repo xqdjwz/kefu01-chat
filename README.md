@@ -64,12 +64,19 @@ R2	对象存储，存聊天图片	10 GB 存储，读取不收流量费	桶名 ke
 ## 部署（不需要任何命令行）
 
 1.**注册登陆GitHub账户**；访问项目地址 https://github.com/xqdjwz/kefu01-chat/，✨Star，右上角点击 Fork 到自己账户，
+
 2.**注册登陆Cloudflare账户**；https://dash.cloudflare.com/login，不会使用的访问 https://xqdj.pp.ua/guide
+
 3. **建 D1 数据库**：Cloudflare 控制台 → Storage & Databases → D1 SQL Database → Create database，名称 `kefu_db`，创建后复制 `Database ID`。
+
 4. **建 R2 存储桶**：名称kefu-files，复制名称，粘贴到 wrangler.toml 第21行
+
 5. **填数据库ID**：在 GitHub 打开 `wrangler.toml`，把第15行 `REPLACE_WITH_YOUR_D1_DATABASE_ID` 替换成自己的数据库 ID，提交。
-5. **创建workers应用程序**：Cloudflare 控制台 → Workers & Pages → Create → Workers → Import a repository → 选这个仓库；构建命令 `npm install`，部署命令 `npx wrangler deploy` → 部署。
-6. 部署好后，打开输出的 `https://cf-kefu-chat.xxx.workers.dev`（访客端），`/agent` 是客服端。**第一次登录时输入的口令会自动成为系统口令。**
+
+6. **创建workers应用程序**：Cloudflare 控制台 → Workers & Pages → Create → Workers → Import a repository → 选这个仓库；构建命令 `npm install`，部署命令 `npx wrangler deploy` → 部署。
+
+7. 部署好后，打开输出的 `https://cf-kefu-chat.xxx.workers.dev`（访客端），`/agent` 是客服端。**第一次登录时输入的口令会自动成为系统口令。**
+
 > 数据表由 Worker 首次请求时自动创建，不需要执行 `wrangler d1 migrations apply`。
 
 ## 改配置
