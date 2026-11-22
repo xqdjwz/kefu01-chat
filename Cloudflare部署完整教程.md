@@ -1,58 +1,5 @@
 # 在线客服系统 · Cloudflare 从零到上线完整教程
 
-> 适用：`cf-kefu-chat-修复版.zip`（Workers + D1 + 静态页面，全部在你现有免费额度内）
-> 全程浏览器官网操作，**不需要命令行、不需要装任何软件**。
-> 如果界面文字和本文略有差异，认按钮位置和意思就行（Cloudflare 后台中英文会混排）。
-
----
-
-## 目录
-
-- [0. 先定方案：Workers 还是 Pages](#0-先定方案workers-还是-pages)
-- [1. 名词速查（看懂后面所有步骤）](#1-名词速查看懂后面所有步骤)
-- [2. 需要准备的东西](#2-需要准备的东西)
-- [3. 最短路线（急着上线看这里）](#3-最短路线急着上线看这里)
-- [4. 第一步：彻底清空旧部署](#4-第一步彻底清空旧部署)
-- [5. 第二步：把代码传到 GitHub](#5-第二步把代码传到-github)
-- [6. 第三步：创建 D1 数据库](#6-第三步创建-d1-数据库)
-- [7. 第四步：把 Database ID 写进 wrangler.toml](#7-第四步把-database-id-写进-wranglertoml)
-- [8. 第五步：Workers Builds 自动部署](#8-第五步workers-builds-自动部署)
-- [9. 第六步：首次验证（判断到底部署的是哪一版）](#9-第六步首次验证判断到底部署的是哪一版)
-- [10. 第七步：设置客服口令并开始使用](#10-第七步设置客服口令并开始使用)
-- [11. 第八步：12 项功能自检清单](#11-第八步12-项功能自检清单)
-- [12. 第九步：绑定自己的域名（可选）](#12-第九步绑定自己的域名可选)
-- [13. 日常维护：改设置、改口令、看日志、备份](#13-日常维护改设置改口令看日志备份)
-- [14. 报错排查表（按提示文字对号入座）](#14-报错排查表按提示文字对号入座)
-- [15. 费用与免费额度](#15-费用与免费额度)
-- [附录 A：用 GitHub Actions 部署（备选）](#附录-a用-github-actions-部署备选)
-- [附录 B：本地想先预览（需要命令行，可选）](#附录-b本地想先预览需要命令行可选)
-
----
-
-## 0. 先定方案：Workers 还是 Pages
-
-**结论：用 Workers。这套代码就是按 Workers 写的，用 Pages 要改代码结构。**
-
-| 对比项 | Workers（本项目用这个） | Pages |
-|---|---|---|
-| 适合什么 | 全栈：有接口、有数据库、有登录 | 静态网站 + 轻量函数 |
-| 静态页面怎么放 | `[assets]` 绑定 `public/` 目录，Worker 同时处理 `/api/*` | 构建产物目录 + `functions/` 目录（另一套写法） |
-| 数据库绑定（D1） | 直接在 `wrangler.toml` 里声明，部署时自动挂上 | 也能绑，但要写在 Pages 项目设置里 |
-| Cloudflare 官方方向 | 新功能主线，Pages 的做法正在向 Workers 合并 | 维护中，新项目官方更推荐 Workers |
-| 本项目的改动成本 | 0（已经有 `wrangler.toml` 和 `src/index.js`） | 要重写成 `functions/` 或 `_worker.js`，代码结构会变 |
-
-再具体一点，你这套系统有 4 样东西必须同时存在：
-
-1. 访客页面 `/` 和客服页面 `/agent`（静态文件）
-2. `/api/session`、`/api/messages` 等十几个接口（动态计算）
-3. D1 数据库（存会话、消息、备注、口令、图片）
-4. 同一个域名下同时提供 1、2、3
-
-Workers 用一行 `[assets]` 配置就把静态文件和接口合到一个域名里；Pages 要做到同样效果得换成它的目录约定，等于重写。所以：
-
-**用 Workers，别用 Pages。D1 是独立的数据库产品，Workers 和 Pages 都能用，跟选哪个前端形态无关。**
-
----
 
 ## 1. 名词速查（看懂后面所有步骤）
 
@@ -72,113 +19,9 @@ Workers 用一行 `[assets]` 配置就把静态文件和接口合到一个域名
 
 - 一个 **Cloudflare 账号**（免费注册，不要信用卡；注册完第一次进 Workers 会让你起一个 `workers.dev` 子域名）
 - 一个 **GitHub 账号**（免费）
-- 电脑上的浏览器（Chrome / Edge）
-- 解压好的 `cf-kefu-chat-修复版.zip`
 
-**不用准备**：服务器、域名（可选）、Node.js、命令行工具、R2 存储桶、API Token。
 
----
-
-## 3. 最短路线（急着上线看这里）
-
-1. 删掉旧 Worker / 旧 D1 / 旧仓库（第 4 步）
-2. 代码传 GitHub（第 5 步）
-3. Cloudflare 建 D1 库 `cf_kefu`，复制 Database ID（第 6 步）
-4. 在 GitHub 网页把 `wrangler.toml` 里那行占位符换成 Database ID（第 7 步）
-5. Cloudflare 里 Import 仓库，构建 `npm install`、部署 `npx wrangler deploy`（第 8 步）
-6. 打开 `/agent`，第一次输入名称+口令就完成初始化（第 10 步）
-
-预计 15～20 分钟，第一次部署构建 1～3 分钟。
-
----
-
-## 4. 第一步：彻底清空旧部署
-
-> 你之前部署过别的版本，想"全部重新来"。按顺序做完这 4 小步，环境就干净了。
-> **注意：删 D1 会连同聊天记录一起删掉，如果你旧库里已经有顾客消息，先看第 13 节"备份"再删。**
-
-### 4.1 删掉旧 Worker
-
-1. 登录 Cloudflare → 左侧 **Workers & Pages**
-2. 在列表里找到你之前建的那个（名字可能是 `cf-kefu-chat`、`kefu`、`worker` 之类）
-3. 点进去 → 上方切到 **Settings**
-4. 拉到页面最下面 → **Delete / 删除** → 按提示输入 Worker 名称确认
-
-> 如果列表里有两个（比如一个旧版、一个试手的），都删掉。删错了也没关系，重新导入仓库会再建一个。
-
-### 4.2 删掉旧 D1 数据库（或换一个新库名）
-
-1. 左侧 **Storage & Databases / 存储和数据库** → **D1 SQL Database**
-2. 点开旧库（比如 `cf_kefu`）→ 切到 **Settings**
-3. 拉到最下面 → **Delete database** → 确认
-
-如果你**不想删旧数据**，就用另一个办法：新建一个库叫 `cf_kefu_v2`，然后第 7 步把 `wrangler.toml` 里的 `database_name` 也改成 `cf_kefu_v2`（两处都要改：`database_name` 和 `database_id`）。
-
-### 4.3 删掉旧 GitHub 仓库
-
-1. GitHub → 打开旧仓库 → **Settings**
-2. 拉到最下面 → **Delete this repository** → 按提示输入仓库名确认
-
-不想删旧仓库也行，新建一个不同名字的仓库（比如 `cf-kefu-chat-v2`）即可，不影响后面步骤。
-
-### 4.4 清掉浏览器里的旧登录状态（可选但推荐）
-
-旧版本可能在浏览器里存了旧的访客身份和客服 token，新站会认不出来。清理方法（任一即可）：
-
-- **最简单**：直接用新域名打开（域名换了，旧的本地数据天然不会带过去）
-- 如果沿用同一个 workers.dev 地址：浏览器地址栏左边的锁/设置图标 → **网站数据 / Cookies** → 清除该站点数据；或者用无痕窗口先测一遍
-
----
-
-## 5. 第二步：把代码传到 GitHub
-
-### 5.1 新建仓库
-
-1. GitHub 右上角 **+** → **New repository**
-2. Repository name 填 `cf-kefu-chat`（名字随便，但后面 Cloudflare 里 Worker 名要用 `cf-kefu-chat`，见 8.3）
-3. 选 **Private**（私有）就行，免费账号也能用私有仓库
-4. **不要**勾选 "Add a README file"（避免和包里的 README 冲突）
-5. 点 **Create repository**
-
-### 5.2 把文件传上去（网页拖拽）
-
-1. 新仓库页面会有一个 **uploading an existing file** 的蓝字链接，点它
-2. 打开你解压出来的文件夹，把里面**所有内容**一起选中拖到网页的虚线框里：
-   - `src`（文件夹）
-   - `public`（文件夹）
-   - `migrations`（文件夹）
-   - `docs`（文件夹，预览图，可不传）
-   - `wrangler.toml`
-   - `package.json`、`package-lock.json`
-   - `README.md`、`部署说明.md`
-   - 预览文件夹（可选，只影响你看图）
-3. 等进度条走完（大约 2 MB，很快），下面填一句说明比如 `init`
-4. 点绿色 **Commit changes**
-
-> **关键**：`wrangler.toml` 必须出现在仓库**根目录**（和 `src` 文件夹并列），不能藏在某个子文件夹里。这是后面部署成功的硬条件。
-
-### 5.3 传完自检
-
-刷新仓库首页，应该能看到这样的结构（`wrangler.toml`、`package.json` 在根目录）：
-
-```
-.github/            （可选，用 Actions 才需要；没有也不影响）
-docs/
-migrations/
-public/
-src/
-package.json
-package-lock.json
-README.md
-wrangler.toml       ← 必须在根目录
-部署说明.md
-```
-
-**看不到 `.github` 很正常**：以点开头的文件夹在 Windows 资源管理器里是隐藏的。这个文件夹是可选的，Workers Builds 不需要它，不传也行。
-
----
-
-## 6. 第三步：创建 D1 数据库
+## 3. 第一步：创建 D1 数据库
 
 1. Cloudflare 左侧菜单 → **Storage & Databases / 存储和数据库**
 2. 点 **D1 SQL Database**
@@ -192,36 +35,14 @@ wrangler.toml       ← 必须在根目录
 
 ---
 
-## 7. 第四步：把 Database ID 写进 wrangler.toml
+## 4. 第二步：把 Database ID 写进 wrangler.toml
 
 1. GitHub 仓库首页点开 `wrangler.toml`
 2. 右上角 **铅笔图标** 进入编辑
 3. 找到这一段：
 
 ```toml
-[[d1_databases]]
-binding = "DB"
-database_name = "cf_kefu"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
-migrations_dir = "migrations"
-```
-
-把 `database_id` 的值替换成刚才复制的 ID，改完是这样（示例）：
-
-```toml
-[[d1_databases]]
-binding = "DB"
-database_name = "cf_kefu"
-database_id = "a1b2c3d4-1234-5678-9abc-def012345678"
-migrations_dir = "migrations"
-```
-
-4. 页面下方 **Commit changes** 保存
-
-完整的 `wrangler.toml` 应该是这样（可以拿来对照，别漏掉 `[assets]` 和 `[[d1_databases]]`）：
-
-```toml
-name = "cf-kefu-chat"
+name = "kefu-chat"
 main = "src/index.js"
 compatibility_date = "2025-04-01"
 workers_dev = true
@@ -232,14 +53,14 @@ binding = "ASSETS"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "cf_kefu"
+database_name = "kefu_db"
 database_id = "你的-Database-ID"
 migrations_dir = "migrations"
 
 # 可选：想用 R2 存大图时再去掉注释
 # [[r2_buckets]]
 # binding = "BUCKET"
-# bucket_name = "cf-kefu-files"
+# bucket_name = "kefu-files"
 
 [vars]
 SHOP_NAME = "在线客服"
@@ -251,12 +72,13 @@ RECALL_WINDOW_SEC = "120"
 [observability]
 enabled = true
 ```
+4. 页面下方 **Commit changes** 保存
 
 > `[vars]` 里这几项只是**初始默认值**，部署后都能在「客服工作台 → 设置」里改，改完立即生效，不用回来改代码。
 
 ---
 
-## 8. 第五步：Workers Builds 自动部署
+## 8. 第三步：Workers Builds 自动部署
 
 ### 8.1 进入创建流程
 
@@ -710,13 +532,13 @@ window.cfKefuConfig = {
 
 ### 想启用 R2 存大图（可选）
 
-1. Cloudflare 左侧 → **R2** → **Create bucket**，名字 `cf-kefu-files`（R2 首次开通可能要求绑定付款方式，免费额度 10GB）
+1. Cloudflare 左侧 → **R2** → **Create bucket**，名字 `kefu-files`（R2 首次开通可能要求绑定付款方式，免费额度 10GB）
 2. GitHub 打开 `wrangler.toml`，把这三行前面的 `#` 去掉：
 
 ```toml
 [[r2_buckets]]
 binding = "BUCKET"
-bucket_name = "cf-kefu-files"
+bucket_name = "kefu-files"
 ```
 
 3. 提交，等自动部署。之后 `/api/health` 会显示 `"storage":"r2+d1"`，图片自动存 R2，单张可到 5MB。
