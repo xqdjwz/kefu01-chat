@@ -1,1721 +1,826 @@
-/**
- * 在线客服聊天 · Cloudflare Workers + D1（图片可选 R2）
- *
- * 设计要点：
- * 1. 第一次请求时自动建表、自动写默认设置 —— 不需要在终端跑任何数据库命令；
- * 2. 客服口令、客服名称、店铺名称、欢迎语都存在 D1 里 —— 部署后在网页上就能改；
- * 3. 图片优先存 R2；没有配置 R2 时自动存进 D1（小于 700KB 的图都能正常收发）。
- *
- * 接口一览：
- *   GET  /api/health
- *   POST /api/session                 访客建立/恢复会话
- *   POST /api/login                   客服登录（名称 + 口令；首次口令即初始化）
- *   GET  /api/me                      当前客服信息
- *   POST /api/agent/profile           修改客服名称
- *   GET  /api/settings                读取设置
- *   POST /api/settings                修改设置（店铺名 / 欢迎语 / 口令）
- *   GET  /api/conversations           会话列表（含未读、在线、备注）
- *   POST /api/conversations/:id/remark 备注顾客
- *   GET  /api/messages                拉消息（after 增量 / since 状态变化）
- *   POST /api/messages                发消息
- *   POST /api/messages/:id/recall     撤回
- *   POST /api/messages/:id/delete     删除（只对自己隐藏）
- *   POST /api/upload                  上传图片
- *   GET  /api/file/:key               读图片
- *   POST /api/read                    标记已读
- */
+// cf-kefu-chat 在线客服系统 v3.4-2026-11-23
+// Cloudflare Workers + D1 单文件后端。全免费栈，无付费依赖。
+// 新增：同IP客户归并合并、AI托管智能回复、对话结束语（结束/重开）、视频/语音外部链接面板。
 
-const JSON_HEADERS = {
-  'content-type': 'application/json; charset=utf-8',
-  'cache-control': 'no-store',
-};
+const VERSION = 'v3.4-2026-11-23';
 
-const AUDIO_TYPES = {
-  'audio/mpeg': 'mp3',
-  'audio/mp3': 'mp3',
-  'audio/mp4': 'm4a',
-  'audio/x-m4a': 'm4a',
-  'audio/ogg': 'ogg',
-  'audio/wav': 'wav',
-  'audio/x-wav': 'wav',
-  'audio/aac': 'aac',
-};
-
-const IMAGE_TYPES = {
-  'image/jpeg': 'jpg',
-  'image/png': 'png',
-  'image/gif': 'gif',
-  'image/webp': 'webp',
-  'image/avif': 'avif',
-};
-
-const MAX_TEXT_LEN = 1000;
-// D1 单行数据有体积上限，没配 R2 时用它兜底存图
-const D1_MAX_FILE_BYTES = 700 * 1024;
-
-// 免费额度口径（用于后台显示百分比，不是硬编码限制）
-const D1_FREE_BYTES = 5 * 1024 * 1024 * 1024;
-const ROW_OVERHEAD_BYTES = 120; // 每行索引与元数据的估算开销
-
-// 默认值优先取 wrangler.toml 的 [vars]，取不到再用兜底文案
-// 预置关键词（后台可改可删）：包含匹配、不区分大小写
-const DEFAULT_KEYWORDS = [
-  { k: '你好', r: '您好😊，欢迎咨询！请问有什么可以帮您？' },
-  { k: '您好', r: '您好😊，欢迎咨询！请问有什么可以帮您？' },
-  { k: '在吗', r: '我在的，请直接说明您的问题，我马上回复您~' },
-  { k: '价格', r: '方便说下您要咨询的项目吗？我给你详细报价~' },
-  { k: '多少钱', r: '方便说下您要咨询的项目吗？我给你详细报价~' },
-  { k: '售后', r: '麻烦描述一下遇到的问题，最好附带截图或订单号，我这边帮你处理。' },
-];
-
-const DEFAULT_OFFLINE_KEYWORDS = [
-  { k: '在吗', r: '您好，当前客服不在线⏰，您可以直接留言，上线后第一时间回复您！' },
-  { k: '你好', r: '您好😊，客服暂未上线，请留下您的问题，我们看到后会联系您。' },
-  { k: '价格', r: '客服暂时离线，报价信息请留言，上线后单独发给您。' },
-  { k: '售后', r: '当前无客服在线，麻烦留下订单号，上线后优先处理售后。' },
-];
-
-const baseSettings = (env) => ({
-  shop_name: (env && env.SHOP_NAME) || '在线客服',
-  welcome_enabled: '1',
-  welcome_text: (env && env.WELCOME_MESSAGE) || '您好！欢迎光临，请问有什么可以帮您？',
-  welcome_from: (env && env.AGENT_NAME) || '客服',
-  passcode_hash: '',
-  auto_clean_days: '0',
-  last_clean_at: '0',
-  agent_avatar_key: '',
-  agent_online: '1',
+const DEFAULT_SETTINGS = {
+  shop_name: '在线客服',
+  agent_name: '客服',
+  welcome_message: '您好，请问有什么可以帮您？',
+  offline_message: '当前客服不在线，请留下您的问题和联系方式，我们会尽快回复。',
+  online_status: 'online',
   auto_reply_enabled: '1',
-  offline_reply_enabled: '1',
-  keywords: JSON.stringify(DEFAULT_KEYWORDS),
-  offline_keywords: JSON.stringify(DEFAULT_OFFLINE_KEYWORDS),
-  sound_enabled: '1',
-  contact_enabled: '1',
-  contact_prompt: '需要的话可以留下联系方式，方便我们主动联系您',
-  wechat_push_enabled: '0',
-  wechat_sendkey: '',
-  pushplus_token: '',
-  dingtalk_webhook: '',
-  wecom_webhook: '',
-  bark_url: '',
-  sound_repeat: '3',
-  sound_key: '',
-});
-
-const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: JSON_HEADERS });
-
-const fail = (message, status = 400, code = 'bad_request') => json({ error: code, message }, status);
-
-const now = () => Date.now();
-
-const uid = (len = 32) => {
-  const bytes = crypto.getRandomValues(new Uint8Array(Math.ceil(len / 2)));
-  let out = '';
-  for (const b of bytes) out += (b < 16 ? '0' : '') + b.toString(16);
-  return out.slice(0, len);
+  keywords_online: '[]',
+  keywords_offline: '[]',
+  end_message: '本次咨询已结束，感谢来访，有问题随时再联系。',
+  reopenable: '0',
+  ai_enabled: '0',
+  ai_provider: 'deepseek',
+  ai_api_base: 'https://api.deepseek.com/chat/completions',
+  ai_api_key: '',
+  ai_model: 'deepseek-chat',
+  ai_prompt: '你是本店客服，热情简洁回答，不知道就说稍后人工回复',
+  ai_max_rounds: '6',
+  sound_in: 'default',
+  sound_out: 'default',
+  sound_custom: '',
+  sound_repeat: '1',
+  push_serverchan: '',
+  push_pushplus: '',
+  push_dingtalk: '',
+  push_wecom: '',
+  push_bark: '',
+  contact_phone: '',
+  contact_wechat: '',
+  contact_address: '',
+  contact_hours: '',
+  agent_avatar_key: '',
+  admin_token: '',
 };
-
-const sha256 = async (text) => {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-  return Array.from(new Uint8Array(buf))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-};
-
-const base64ToBytes = (b64) => {
-  const bin = atob(b64);
-  const arr = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return arr;
-};
-
-const bytesToBase64 = (buffer) => {
-  const arr = new Uint8Array(buffer);
-  let bin = '';
-  const chunk = 0x8000;
-  for (let i = 0; i < arr.length; i += chunk) {
-    bin += String.fromCharCode.apply(null, arr.subarray(i, i + chunk));
-  }
-  return btoa(bin);
-};
-
-/* ------------------------------- 自动建表 ------------------------------- */
-
-let schemaReady = false;
 
 const TABLES = [
   `CREATE TABLE IF NOT EXISTS conversations (
-     id TEXT PRIMARY KEY,
-     visitor_token TEXT NOT NULL UNIQUE,
-     visitor_name TEXT,
-     remark TEXT,
-     created_at INTEGER NOT NULL,
-     updated_at INTEGER NOT NULL,
-     last_message_at INTEGER,
-     last_preview TEXT,
-     visitor_last_read_at INTEGER NOT NULL DEFAULT 0,
-     agent_last_read_at INTEGER NOT NULL DEFAULT 0,
-     visitor_seen_at INTEGER NOT NULL DEFAULT 0,
-     agent_seen_at INTEGER NOT NULL DEFAULT 0
-   )`,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    visitor_token TEXT, visitor_name TEXT, remark TEXT,
+    created_at TEXT, updated_at TEXT, last_message_at TEXT, last_preview TEXT,
+    visitor_last_read_at TEXT, agent_last_read_at TEXT,
+    visitor_seen_at TEXT, agent_seen_at TEXT,
+    geo_ip TEXT, geo_location TEXT, geo_referer TEXT, geo_device TEXT,
+    contact TEXT, blocked INTEGER DEFAULT 0,
+    customer_id TEXT, status TEXT DEFAULT 'open'
+  )`,
   `CREATE TABLE IF NOT EXISTS messages (
-     id INTEGER PRIMARY KEY AUTOINCREMENT,
-     conv_id TEXT NOT NULL,
-     sender TEXT NOT NULL,
-     sender_name TEXT,
-     type TEXT NOT NULL DEFAULT 'text',
-     body TEXT,
-     file_key TEXT,
-     file_size INTEGER,
-     status TEXT NOT NULL DEFAULT 'active',
-     deleted_visitor INTEGER NOT NULL DEFAULT 0,
-     deleted_agent INTEGER NOT NULL DEFAULT 0,
-     read_at INTEGER,
-     created_at INTEGER NOT NULL,
-     updated_at INTEGER NOT NULL
-   )`,
-  `CREATE TABLE IF NOT EXISTS settings (
-     key TEXT PRIMARY KEY,
-     value TEXT
-   )`,
-  `CREATE TABLE IF NOT EXISTS agents (
-     token TEXT PRIMARY KEY,
-     name TEXT,
-     created_at INTEGER NOT NULL
-   )`,
-  `CREATE TABLE IF NOT EXISTS files (
-     id TEXT PRIMARY KEY,
-     mime TEXT,
-     size INTEGER,
-     data TEXT,
-     created_at INTEGER NOT NULL
-   )`,
-  'CREATE INDEX IF NOT EXISTS idx_conv_last ON conversations(last_message_at DESC)',
-  'CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conv_id, id)',
-  'CREATE INDEX IF NOT EXISTS idx_msg_upd ON messages(conv_id, updated_at)',
-  'CREATE INDEX IF NOT EXISTS idx_msg_unread ON messages(conv_id, sender, read_at)',
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conv_id INTEGER, sender TEXT, sender_name TEXT, type TEXT DEFAULT 'text',
+    body TEXT, file_key TEXT, file_size INTEGER, status TEXT DEFAULT 'sent',
+    deleted_visitor INTEGER DEFAULT 0, deleted_agent INTEGER DEFAULT 0,
+    read_at TEXT, created_at TEXT, updated_at TEXT,
+    auto_reply INTEGER DEFAULT 0, ai_reply INTEGER DEFAULT 0
+  )`,
+  `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`,
+  `CREATE TABLE IF NOT EXISTS agents (token TEXT PRIMARY KEY, name TEXT, created_at TEXT)`,
+  `CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY AUTOINCREMENT, mime TEXT, size INTEGER, data TEXT, created_at TEXT)`,
 ];
 
-// 老版本升级过来的库可能缺列，逐条补，已经存在就跳过
+// 旧库自动补列，禁止要求用户手工 SQL
 const ALTERS = [
-  'ALTER TABLE conversations ADD COLUMN remark TEXT',
-  'ALTER TABLE conversations ADD COLUMN visitor_seen_at INTEGER NOT NULL DEFAULT 0',
-  'ALTER TABLE conversations ADD COLUMN agent_seen_at INTEGER NOT NULL DEFAULT 0',
-  'ALTER TABLE conversations ADD COLUMN geo_ip TEXT',
-  'ALTER TABLE conversations ADD COLUMN geo_location TEXT',
-  'ALTER TABLE conversations ADD COLUMN geo_referer TEXT',
-  'ALTER TABLE conversations ADD COLUMN contact TEXT',
-  'ALTER TABLE conversations ADD COLUMN geo_device TEXT',
-  'ALTER TABLE conversations ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0',
-  'ALTER TABLE messages ADD COLUMN auto_reply INTEGER NOT NULL DEFAULT 0',
+  ['conversations', 'customer_id TEXT'],
+  ['conversations', "status TEXT DEFAULT 'open'"],
+  ['messages', 'ai_reply INTEGER DEFAULT 0'],
 ];
 
+const INDEXES = [
+  'CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conv_id, id)',
+  'CREATE INDEX IF NOT EXISTS idx_conv_last ON conversations(last_message_at)',
+  'CREATE INDEX IF NOT EXISTS idx_conv_ip ON conversations(geo_ip)',
+];
+
+// ---------- 工具 ----------
+function now() { return new Date().toISOString(); }
+
+function json(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', ...headers },
+  });
+}
+
+function text(body, status = 200, headers = {}) {
+  return new Response(body, { status, headers: { 'Content-Type': 'text/plain; charset=utf-8', ...headers } });
+}
+
+async function sha256(str) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function parseCookies(req) {
+  const out = {};
+  const raw = req.headers.get('cookie') || '';
+  raw.split(';').forEach(p => {
+    const i = p.indexOf('=');
+    if (i > 0) out[p.slice(0, i).trim()] = decodeURIComponent(p.slice(i + 1).trim());
+  });
+  return out;
+}
+
+function bearer(req) {
+  const h = req.headers.get('authorization') || '';
+  if (h.startsWith('Bearer ')) return h.slice(7).trim();
+  return '';
+}
+
+function clientIp(req) {
+  const cf = req.headers.get('cf-connecting-ip');
+  if (cf) return cf.trim();
+  const xff = req.headers.get('x-forwarded-for') || '';
+  const first = xff.split(',')[0].trim();
+  return first || '';
+}
+
+async function readBody(req) {
+  try { return await req.json(); } catch { return {}; }
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// ---------- 建表 ----------
+let schemaReady = false;
 async function ensureSchema(env) {
   if (schemaReady) return;
-  const db = env.DB;
-  if (!db) throw new Error('D1 未绑定：请在 wrangler.toml 的 [[d1_databases]] 里填好 database_id');
-
   for (const sql of TABLES) {
-    try {
-      await db.prepare(sql).run();
-    } catch (e) {
-      // "already exists" 之类的报错直接忽略
-      console.warn('schema:', String(e && e.message));
-    }
+    try { await env.DB.prepare(sql).run(); } catch (e) { /* 已存在 */ }
   }
-  for (const sql of ALTERS) {
-    try {
-      await db.prepare(sql).run();
-    } catch {
-      /* 列已存在 */
-    }
+  for (const sql of INDEXES) {
+    try { await env.DB.prepare(sql).run(); } catch (e) { /* 已存在 */ }
   }
-  for (const [key, value] of Object.entries(baseSettings(env))) {
-    try {
-      await db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').bind(key, value).run();
-    } catch (e) {
-      console.warn('seed settings:', String(e && e.message));
-    }
+  for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
+    try { await env.DB.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').bind(k, v).run(); } catch (e) {}
+  }
+  for (const [table, col] of ALTERS) {
+    try { await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${col}`).run(); } catch (e) { /* 列已存在 */ }
   }
   schemaReady = true;
 }
 
+// ---------- 设置读取 ----------
 async function getSettings(env) {
-  const { results } = await env.DB.prepare('SELECT key, value FROM settings').all();
-  const out = { ...baseSettings(env) };
-  for (const row of results || []) out[row.key] = row.value;
+  const rows = await env.DB.prepare('SELECT key, value FROM settings').all();
+  const out = {};
+  for (const r of rows.results) out[r.key] = r.value;
+  for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) if (out[k] === undefined) out[k] = v;
   return out;
 }
 
-async function setSettings(env, patch) {
-  for (const [key, value] of Object.entries(patch)) {
-    await env.DB.prepare(
-      'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
-    )
-      .bind(key, String(value))
-      .run();
-  }
+// 下发给访客的公开设置（绝不含 ai_api_key / admin_token）
+function publicSettings(s) {
+  const keep = ['shop_name', 'agent_name', 'welcome_message', 'offline_message', 'end_message',
+    'reopenable', 'online_status', 'contact_phone', 'contact_wechat', 'contact_address', 'contact_hours'];
+  const out = {};
+  for (const k of keep) out[k] = s[k];
+  return out;
 }
 
-/* --------------------------------- 入口 --------------------------------- */
-
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
-    if (url.pathname === '/api' || url.pathname.startsWith('/api/')) {
-      try {
-        await ensureSchema(env);
-        return await handleApi(request, env, url, ctx);
-      } catch (e) {
-        console.error('api error', e && e.stack ? e.stack : e);
-        return fail(`服务暂时不可用：${(e && e.message) || '未知错误'}`, 500, 'server_error');
-      }
-    }
-
-    return serveAsset(request, env, url);
-  },
-};
-
-/* -------------------------------- 静态资源 -------------------------------- */
-
-async function serveAsset(request, env, url) {
-  if (request.method !== 'GET' && request.method !== 'HEAD') {
-    return new Response('Method Not Allowed', { status: 405 });
-  }
-  if (!env.ASSETS) {
-    return new Response('静态资源未绑定：请保留 wrangler.toml 中的 [assets] 配置', { status: 500 });
-  }
-
-  let path = url.pathname;
-  if (path === '/' || path === '') path = '/index.html';
-  else if (path === '/agent' || path === '/agent/') path = '/agent.html';
-
-  const target = new Request(new URL(path + url.search, url.origin).toString(), request);
-  const res = await env.ASSETS.fetch(target);
-
-  if (!res) return new Response('Not Found', { status: 404 });
-
-  const headers = new Headers(res.headers);
-  headers.set('x-content-type-options', 'nosniff');
-  headers.set('referrer-policy', 'same-origin');
-  if (path.endsWith('.html') || path === '/') headers.set('cache-control', 'no-cache');
-  return new Response(res.body, { status: res.status, headers });
-}
-
-/* -------------------------------- 身份识别 -------------------------------- */
-
-async function identify(request, env) {
-  const auth = request.headers.get('authorization') || '';
-  if (auth.startsWith('Bearer ')) {
-    const token = auth.slice(7).trim();
-    if (token) {
-      const row = await env.DB.prepare('SELECT token, name FROM agents WHERE token = ?').bind(token).first();
-      if (row) return { role: 'agent', token, name: row.name || '客服' };
-    }
-  }
-
-  const vt = (request.headers.get('x-visitor-token') || '').trim();
-  if (vt) {
-    const conv = await env.DB.prepare(
-      'SELECT id, visitor_token, visitor_name, remark FROM conversations WHERE visitor_token = ?'
-    )
-      .bind(vt)
-      .first();
-    if (conv) {
-      return {
-        role: 'visitor',
-        token: vt,
-        convId: conv.id,
-        name: conv.visitor_name || '访客',
-        remark: conv.remark || '',
-      };
-    }
-  }
+// ---------- 鉴权 ----------
+async function agentTokenFromReq(req, env) {
+  const t = bearer(req) || parseCookies(req).agent_token || '';
+  if (!t) return null;
+  const s = await getSettings(env);
+  const h = await sha256(t);
+  if (s.admin_token && h === s.admin_token) return t;
+  const row = await env.DB.prepare('SELECT token FROM agents WHERE token = ?').bind(h).first();
+  if (row) return t;
   return null;
 }
 
-async function resolveConvId(request, ident, url, body) {
-  if (!ident) return null;
-  const asked = (body && (body.conv || body.convId)) || url.searchParams.get('conv') || null;
-  // 访客不传会话就用自己那条；传了别的会话号交给调用方做 403 判断
-  if (ident.role === 'visitor') return asked || ident.convId;
-  return asked;
+async function requireAgent(req, env) {
+  const t = await agentTokenFromReq(req, env);
+  return t ? t : null;
 }
 
-/* --------------------------------- 路由 --------------------------------- */
-
-async function handleApi(request, env, url, ctx) {
-  const path = url.pathname;
-  const method = request.method;
-
-  if (path === '/api/health') {
-    return json({
-      ok: true,
-      ts: now(),
-      version: 'v3.3-2026-11-21',
-      features: ['avatar', 'geo', 'autoReply', 'sound', 'customSound', 'contact', 'pushMulti', 'export', 'embed'],
-      storage: env.BUCKET ? 'r2+d1' : 'd1',
+// ---------- AI ----------
+async function callAI(env, s, history, userMsg) {
+  if (!s.ai_api_key || !s.ai_api_base) return null;
+  const msgs = [{ role: 'system', content: s.ai_prompt || '你是本店客服，热情简洁回答，不知道就说稍后人工回复' },
+    ...history, { role: 'user', content: userMsg }];
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const res = await fetch(s.ai_api_base, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + s.ai_api_key },
+      body: JSON.stringify({ model: s.ai_model, messages: msgs, temperature: 0.7, stream: false }),
+      signal: ctrl.signal,
     });
-  }
-
-  if (path === '/api/login' && method === 'POST') return handleLogin(request, env);
-
-  if (path === '/api/me' && method === 'GET') {
-    const ident = await identify(request, env);
-    if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
-    const s = await getSettings(env);
-    return json({ name: ident.name, shopName: s.shop_name, ...publicSettings(s) });
-  }
-
-  if (path === '/api/agent/profile' && method === 'POST') return handleAgentProfile(request, env);
-
-  if (path === '/api/settings' && method === 'GET') return handleGetSettings(request, env);
-  if (path === '/api/settings' && method === 'POST') return handleSaveSettings(request, env);
-
-  if (path === '/api/stats' && method === 'GET') return handleStats(request, env);
-  if (path === '/api/cleanup' && method === 'POST') return handleCleanup(request, env);
-
-  if (path === '/api/session' && method === 'POST') return handleSession(request, env);
-
-  if (path === '/api/conversations' && method === 'GET') {
-    const ident = await identify(request, env);
-    if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
-    return handleConversationList(env);
-  }
-
-  if (path === '/api/messages' && method === 'GET') return handleListMessages(request, env, url);
-  if (path === '/api/messages' && method === 'POST') return handleSendMessage(request, env, url, ctx);
-
-  const msgAction = path.match(/^\/api\/messages\/(\d+)\/(recall|delete)$/);
-  if (msgAction && method === 'POST') return handleMessageAction(request, env, Number(msgAction[1]), msgAction[2]);
-
-  const remarkMatch = path.match(/^\/api\/conversations\/([a-zA-Z0-9_-]+)\/remark$/);
-  if (remarkMatch && method === 'POST') return handleRemark(request, env, remarkMatch[1]);
-
-  // 兼容旧接口名
-  const delMatch = path.match(/^\/api\/conversations\/([a-zA-Z0-9_-]+)$/);
-  if (delMatch && method === 'DELETE') return handleDeleteConversation(request, env, delMatch[1]);
-
-  const blockMatch = path.match(/^\/api\/conversations\/([a-zA-Z0-9_-]+)\/block$/);
-  if (blockMatch && method === 'POST') return handleBlock(request, env, blockMatch[1]);
-
-  const renameMatch = path.match(/^\/api\/conversations\/([a-zA-Z0-9_-]+)\/rename$/);
-  if (renameMatch && method === 'POST') return handleRemark(request, env, renameMatch[1]);
-
-  if (path === '/api/upload' && method === 'POST') return handleUpload(request, env, url, ctx);
-  if (path === '/api/avatar/agent' && method === 'GET') return handleAgentAvatar(env);
-  if (path === '/api/avatar' && method === 'POST') return handleAvatar(request, env);
-  if (path === '/api/avatar/clear' && method === 'POST') return handleAvatarClear(request, env);
-  if (path === '/api/sound' && method === 'POST') return handleSoundUpload(request, env);
-  if (path.startsWith('/api/file/') && method === 'GET') return handleFile(env, path.slice('/api/file/'.length));
-
-  if (path === '/api/read' && method === 'POST') return handleRead(request, env, url);
-
-  if (path === '/api/contact' && method === 'POST') return handleContact(request, env);
-  if (path === '/api/export' && method === 'GET') return handleExport(request, env, url);
-
-  return fail('接口不存在', 404, 'not_found');
-}
-
-async function safeBody(request) {
-  try {
-    return (await request.json()) || {};
-  } catch {
-    return {};
-  }
-}
-
-const publicSettings = (s) => ({
-  shopName: s.shop_name || '在线客服',
-  welcomeEnabled: s.welcome_enabled === '1',
-  welcomeText: s.welcome_text || '',
-  welcomeFrom: s.welcome_from || '客服',
-  agentAvatarUrl: s.agent_avatar_key ? '/api/file/' + s.agent_avatar_key : '',
-  contactEnabled: s.contact_enabled === '1',
-  contactPrompt: s.contact_prompt || '需要的话可以留下联系方式，方便我们主动联系您',
-});
-
-/* --------------------------------- 登录 --------------------------------- */
-
-async function handleLogin(request, env) {
-  const body = await safeBody(request);
-  const passcode = String(body.passcode || body.token || '').trim();
-  const name = String(body.name || '').trim().slice(0, 16);
-
-  if (passcode.length < 4) return fail('口令至少 4 位', 400, 'weak_passcode');
-  if (passcode.length > 64) return fail('口令太长', 400, 'passcode_too_long');
-
-  const s = await getSettings(env);
-  const hash = await sha256(passcode);
-  let firstTime = false;
-
-  if (!s.passcode_hash) {
-    // 第一次登录：把这次输入的口令设为系统口令，不用去 Cloudflare 后台配密钥
-    await setSettings(env, { passcode_hash: hash });
-    firstTime = true;
-  } else if (s.passcode_hash !== hash) {
-    return fail('口令不正确', 401, 'unauthorized');
-  }
-
-  const agentName = name || '客服';
-  const token = uid(40);
-  await env.DB.prepare('INSERT INTO agents (token, name, created_at) VALUES (?, ?, ?)')
-    .bind(token, agentName, now())
-    .run();
-
-  return json({
-    ok: true,
-    token,
-    name: agentName,
-    firstTime,
-    ...publicSettings(s),
-  });
-}
-
-async function handleAgentProfile(request, env) {
-  const ident = await identify(request, env);
-  if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
-
-  const body = await safeBody(request);
-  const name = String(body.name || '').trim().slice(0, 16);
-  if (!name) return fail('客服名称不能为空', 400, 'empty');
-
-  await env.DB.prepare('UPDATE agents SET name = ? WHERE token = ?').bind(name, ident.token).run();
-  return json({ ok: true, name });
-}
-
-/* --------------------------------- 设置 --------------------------------- */
-
-async function handleGetSettings(request, env) {
-  const ident = await identify(request, env);
-  if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
-  const s = await getSettings(env);
-  return json({
-    ...publicSettings(s),
-    agentName: ident.name,
-    passcodeSet: !!s.passcode_hash,
-    recallWindow: Number(env.RECALL_WINDOW_SEC || 120),
-    imageStorage: env.BUCKET ? 'R2 + D1' : 'D1',
-    autoCleanDays: Number(s.auto_clean_days) || 0,
-    agentOnline: s.agent_online === '1',
-    autoReplyEnabled: s.auto_reply_enabled === '1',
-    offlineReplyEnabled: s.offline_reply_enabled === '1',
-    keywords: parseRules(s.keywords),
-    offlineKeywords: parseRules(s.offline_keywords),
-    soundEnabled: s.sound_enabled === '1',
-    wechatPushEnabled: s.wechat_push_enabled === '1',
-    wechatSendKey: s.wechat_sendkey || '',
-    pushplusToken: s.pushplus_token || '',
-    dingtalkWebhook: s.dingtalk_webhook || '',
-    wecomWebhook: s.wecom_webhook || '',
-    barkUrl: s.bark_url || '',
-    soundRepeat: Number(s.sound_repeat) || 3,
-    soundUrl: s.sound_key ? '/api/file/' + s.sound_key : '',
-  });
-}
-
-async function handleSaveSettings(request, env) {
-  const ident = await identify(request, env);
-  if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
-
-  const body = await safeBody(request);
-  const patch = {};
-
-  if (body.shopName !== undefined) {
-    const v = String(body.shopName).trim().slice(0, 24);
-    if (!v) return fail('店铺名称不能为空', 400, 'empty');
-    patch.shop_name = v;
-  }
-  if (body.welcomeText !== undefined) patch.welcome_text = String(body.welcomeText).slice(0, 500);
-  if (body.welcomeEnabled !== undefined) patch.welcome_enabled = body.welcomeEnabled ? '1' : '0';
-  if (body.welcomeFrom !== undefined) {
-    const v = String(body.welcomeFrom).trim().slice(0, 16);
-    patch.welcome_from = v || '客服';
-  }
-  if (body.newPasscode !== undefined && String(body.newPasscode).trim()) {
-    const v = String(body.newPasscode).trim();
-    if (v.length < 4) return fail('新口令至少 4 位', 400, 'weak_passcode');
-    patch.passcode_hash = await sha256(v);
-  }
-  if (body.agentName !== undefined) {
-    const v = String(body.agentName).trim().slice(0, 16);
-    if (!v) return fail('客服名称不能为空', 400, 'empty');
-    await env.DB.prepare('UPDATE agents SET name = ? WHERE token = ?').bind(v, ident.token).run();
-    ident.name = v;
-  }
-  if (body.autoCleanDays !== undefined) {
-    const n = Math.floor(Number(body.autoCleanDays));
-    if (!Number.isFinite(n) || n < 0 || n > 3650) return fail('自动清理天数需在 0～3650 之间', 400, 'bad_range');
-    patch.auto_clean_days = String(n);
-  }
-  if (body.agentOnline !== undefined) patch.agent_online = body.agentOnline ? '1' : '0';
-  if (body.autoReplyEnabled !== undefined) patch.auto_reply_enabled = body.autoReplyEnabled ? '1' : '0';
-  if (body.offlineReplyEnabled !== undefined) patch.offline_reply_enabled = body.offlineReplyEnabled ? '1' : '0';
-  if (body.soundEnabled !== undefined) patch.sound_enabled = body.soundEnabled ? '1' : '0';
-  if (body.contactEnabled !== undefined) patch.contact_enabled = body.contactEnabled ? '1' : '0';
-  if (body.wechatPushEnabled !== undefined) patch.wechat_push_enabled = body.wechatPushEnabled ? '1' : '0';
-  if (body.wechatSendKey !== undefined) {
-    const v = String(body.wechatSendKey).trim().slice(0, 60);
-    if (v && !/^[A-Za-z0-9_-]{6,60}$/.test(v)) return fail('SendKey 格式不正确（应为一串字母数字）', 400, 'bad_sendkey');
-    patch.wechat_sendkey = v;
-  }
-  const urlOk = (v, prefix) => {
-    if (!v) return true;
-    try {
-      const u = new URL(v);
-      return u.protocol === 'https:' && (!prefix || v.includes(prefix));
-    } catch {
-      return false;
-    }
-  };
-  if (body.pushplusToken !== undefined) {
-    const v = String(body.pushplusToken).trim().slice(0, 60);
-    if (v && !/^[A-Za-z0-9]{6,60}$/.test(v)) return fail('PushPlus token 格式不正确', 400, 'bad_pushplus');
-    patch.pushplus_token = v;
-  }
-  if (body.dingtalkWebhook !== undefined) {
-    const v = String(body.dingtalkWebhook).trim().slice(0, 300);
-    if (!urlOk(v, 'oapi.dingtalk.com')) return fail('钉钉机器人地址不对（应为 https://oapi.dingtalk.com/robot/send?access_token=...）', 400, 'bad_dingtalk');
-    patch.dingtalk_webhook = v;
-  }
-  if (body.wecomWebhook !== undefined) {
-    const v = String(body.wecomWebhook).trim().slice(0, 300);
-    if (!urlOk(v, 'qyapi.weixin.qq.com')) return fail('企业微信机器人地址不对（应为 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...）', 400, 'bad_wecom');
-    patch.wecom_webhook = v;
-  }
-  if (body.barkUrl !== undefined) {
-    const v = String(body.barkUrl).trim().slice(0, 300);
-    if (!urlOk(v, 'api.day.app')) return fail('Bark 地址不对（应为 https://api.day.app/你的Key）', 400, 'bad_bark');
-    patch.bark_url = v;
-  }
-  if (body.soundRepeat !== undefined) {
-    const n = Math.floor(Number(body.soundRepeat));
-    if (!Number.isFinite(n) || n < 1 || n > 5) return fail('提示音次数需在 1～5 之间', 400, 'bad_repeat');
-    patch.sound_repeat = String(n);
-  }
-  if (body.clearSound) {
-    const s0 = await getSettings(env);
-    await removeStoredFile(env, s0.sound_key);
-    patch.sound_key = '';
-  }
-  if (body.keywords !== undefined || body.offlineKeywords !== undefined) {
-    const build = (input) => {
-      if (Array.isArray(input)) {
-        return parseRules(JSON.stringify(input));
-      }
-      const lines = String(input || '')
-        .split(/\r?\n/)
-        .map((l) => l.trim())
-        .filter(Boolean);
-      const out = [];
-      for (const line of lines) {
-        const m = line.split(/\s*[=＝|｜]\s*/);
-        if (m.length < 2) continue;
-        const k = m[0].slice(0, 30);
-        const r = m.slice(1).join('=').slice(0, 300);
-        if (k && r) out.push({ k, r });
-      }
-      return out.slice(0, 60);
-    };
-    if (body.keywords !== undefined) patch.keywords = JSON.stringify(build(body.keywords));
-    if (body.offlineKeywords !== undefined) patch.offline_keywords = JSON.stringify(build(body.offlineKeywords));
-  }
-
-  if (Object.keys(patch).length) await setSettings(env, patch);
-
-  const s = await getSettings(env);
-  return json({
-    ok: true,
-    ...publicSettings(s),
-    agentName: ident.name,
-    autoCleanDays: Number(s.auto_clean_days) || 0,
-    agentOnline: s.agent_online === '1',
-    autoReplyEnabled: s.auto_reply_enabled === '1',
-    offlineReplyEnabled: s.offline_reply_enabled === '1',
-    keywords: parseRules(s.keywords),
-    offlineKeywords: parseRules(s.offline_keywords),
-    soundEnabled: s.sound_enabled === '1',
-    wechatPushEnabled: s.wechat_push_enabled === '1',
-    wechatSendKey: s.wechat_sendkey || '',
-    pushplusToken: s.pushplus_token || '',
-    dingtalkWebhook: s.dingtalk_webhook || '',
-    wecomWebhook: s.wecom_webhook || '',
-    barkUrl: s.bark_url || '',
-    soundRepeat: Number(s.sound_repeat) || 3,
-    soundUrl: s.sound_key ? '/api/file/' + s.sound_key : '',
-  });
-}
-
-/* ------------------------------ 用量与清理 ------------------------------ */
-
-const fmtBytes = (n) => {
-  const v = Number(n) || 0;
-  if (v < 1024) return `${Math.round(v)} B`;
-  const units = ['KB', 'MB', 'GB', 'TB'];
-  let x = v / 1024;
-  let i = 0;
-  while (x >= 1024 && i < units.length - 1) {
-    x /= 1024;
-    i += 1;
-  }
-  return `${x >= 100 ? Math.round(x) : x.toFixed(1)} ${units[i]}`;
-};
-
-async function measureUsage(env) {
-  const pick = async (sql, ...args) => (await env.DB.prepare(sql).bind(...args).first()) || {};
-  const conv = await pick('SELECT COUNT(*) AS c FROM conversations');
-  const msg = await pick(
-    "SELECT COUNT(*) AS c, COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0) AS a FROM messages"
-  );
-  const text = await pick("SELECT COALESCE(SUM(LENGTH(COALESCE(body, ''))), 0) AS s FROM messages");
-  const imgs = await pick("SELECT COUNT(*) AS c, COALESCE(SUM(COALESCE(file_size, 0)), 0) AS s FROM messages WHERE type <> 'text'");
-  const files = await pick('SELECT COUNT(*) AS c, COALESCE(SUM(COALESCE(size, 0)), 0) AS s FROM files');
-  const span = await pick('SELECT MIN(created_at) AS first, MAX(created_at) AS last FROM messages');
-
-  const convCount = conv.c || 0;
-  const msgCount = msg.c || 0;
-  const fileCount = files.c || 0;
-  const rows = convCount + msgCount + fileCount;
-  // 文字正文 + D1 里实际存放的图片数据 + 每行固定开销
-  const usedBytes = (text.s || 0) + (files.s || 0) + rows * ROW_OVERHEAD_BYTES;
-
-  const avgMsgBytes = msgCount > 0 ? Math.max(200, Math.round(usedBytes / msgCount)) : 300;
-  const remainingBytes = Math.max(0, D1_FREE_BYTES - usedBytes);
-  const storageMode = env.BUCKET ? 'r2+d1' : 'd1';
-  const avgImageBytes = (imgs.c || 0) > 0 ? Math.round((imgs.s || 0) / imgs.c) : 380 * 1024;
-
-  return {
-    storageMode,
-    usedBytes,
-    usedHuman: fmtBytes(usedBytes),
-    usedPercent: Number(((usedBytes / D1_FREE_BYTES) * 100).toFixed(3)),
-    limitBytes: D1_FREE_BYTES,
-    limitHuman: fmtBytes(D1_FREE_BYTES),
-    remainingBytes,
-    remainingHuman: fmtBytes(remainingBytes),
-    counts: {
-      conversations: convCount,
-      messages: msgCount,
-      activeMessages: msg.a || 0,
-      images: imgs.c || 0,
-      storedFiles: fileCount,
-    },
-    bytes: {
-      text: text.s || 0,
-      filesInD1: files.s || 0,
-      imagesTotal: imgs.s || 0,
-      rowOverhead: rows * ROW_OVERHEAD_BYTES,
-    },
-    estimate: {
-      avgMessageBytes: avgMsgBytes,
-      avgImageBytes,
-      // R2 模式下图片不占 D1，容量主要看文字消息
-      textMessagesLeft: Math.floor(remainingBytes / avgMsgBytes),
-      imagesLeft: storageMode === 'd1' ? Math.floor(remainingBytes / Math.max(avgImageBytes, 1)) : null,
-    },
-    firstMessageAt: span.first || 0,
-    lastMessageAt: span.last || 0,
-  };
-}
-
-async function runCleanup(env, days) {
-  const cutoff = now() - days * 24 * 60 * 60 * 1000;
-  const msgs = await env.DB.prepare('DELETE FROM messages WHERE created_at < ?').bind(cutoff).run();
-  // 清掉没有任何消息再引用的图片（撤回的、删除过的都会变成孤儿）
-  const files = await env.DB.prepare(
-    "DELETE FROM files WHERE id NOT IN (SELECT file_key FROM messages WHERE file_key IS NOT NULL AND file_key <> '')"
-  ).run();
-  const convs = await env.DB.prepare(
-    'DELETE FROM conversations WHERE updated_at < ? AND id NOT IN (SELECT DISTINCT conv_id FROM messages)'
-  )
-    .bind(cutoff)
-    .run();
-  return {
-    days,
-    cutoff,
-    messages: (msgs.meta && msgs.meta.changes) || 0,
-    files: (files.meta && files.meta.changes) || 0,
-    conversations: (convs.meta && convs.meta.changes) || 0,
-  };
-}
-
-async function handleStats(request, env) {
-  const ident = await identify(request, env);
-  if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
-
-  const s = await getSettings(env);
-  const autoCleanDays = Number(s.auto_clean_days) || 0;
-  let cleanup = null;
-
-  // 自动清理：到点了才跑，最多每 6 小时一次，避免每次刷新都删数据
-  if (autoCleanDays > 0) {
-    const last = Number(s.last_clean_at) || 0;
-    if (now() - last > 6 * 60 * 60 * 1000) {
-      cleanup = await runCleanup(env, autoCleanDays);
-      await setSettings(env, { last_clean_at: String(now()) });
-      s.last_clean_at = String(now());
-    }
-  }
-
-  const usage = await measureUsage(env);
-  return json({
-    ok: true,
-    ...usage,
-    autoCleanDays,
-    lastCleanAt: Number(s.last_clean_at) || 0,
-    cleanup,
-  });
-}
-
-async function handleCleanup(request, env) {
-  const ident = await identify(request, env);
-  if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
-
-  const body = await safeBody(request);
-  const days = Math.floor(Number(body.days));
-  if (!Number.isFinite(days) || days < 0 || days > 3650) return fail('清理天数需在 0～3650 之间', 400, 'bad_range');
-  if (body.confirm !== true) return fail('请先确认再清理', 400, 'confirm_required');
-
-  const result = await runCleanup(env, days);
-  await setSettings(env, { last_clean_at: String(now()) });
-  return json({ ok: true, ...result, usage: await measureUsage(env) });
-}
-
-/* --------------------------------- 会话 --------------------------------- */
-
-const parseContact = (raw) => {
-  if (!raw) return null;
-  try {
-    const o = JSON.parse(raw);
-    return o && typeof o === 'object' ? o : null;
-  } catch {
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const reply = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+    return reply ? String(reply).trim() : null;
+  } catch (e) {
+    clearTimeout(timer);
     return null;
   }
-};
-
-const mapConv = (row) => {
-  const t = now();
-  return {
-    id: row.id,
-    name: row.remark || row.visitor_name || '访客',
-    visitorName: row.visitor_name || '访客',
-    remark: row.remark || '',
-    preview: row.last_preview || '',
-    lastMessageAt: row.last_message_at || row.created_at,
-    createdAt: row.created_at,
-    unread: row.unread || 0,
-    online: (row.agent_seen_at || 0) > t - 90 * 1000,
-    ip: row.geo_ip || '',
-    location: row.geo_location || '',
-    referer: row.geo_referer || '',
-    device: row.geo_device || '',
-    blocked: !!row.blocked,
-    lastVisitorAt: row.last_visitor_at || 0,
-    contact: parseContact(row.contact),
-  };
-};
-
-function deviceOf(request, body) {
-  let ua = '';
-  try {
-    ua = (request.headers.get('user-agent') || '').slice(0, 300);
-  } catch {
-    ua = '';
-  }
-  if (typeof body.device === 'string' && body.device.trim()) ua = body.device.slice(0, 300);
-  if (!ua) return '';
-
-  let os = '';
-  if (/iPhone/i.test(ua)) os = 'iPhone';
-  else if (/iPad/i.test(ua)) os = 'iPad';
-  else if (/Android/i.test(ua)) {
-    const m = ua.match(/Android[^;)]*;\s*([^;)]+)/i);
-    os = m && m[1] ? 'Android ' + m[1].replace(/Build.*/i, '').trim().slice(0, 18) : 'Android';
-  } else if (/Windows/i.test(ua)) os = 'Windows';
-  else if (/Macintosh|Mac OS X/i.test(ua)) os = 'Mac';
-  else if (/Linux/i.test(ua)) os = 'Linux';
-
-  let app = '';
-  if (/MicroMessenger/i.test(ua)) app = '微信';
-  else if (/\bQQ\//i.test(ua) || /QQBrowser/i.test(ua)) app = 'QQ';
-  else if (/DingTalk/i.test(ua)) app = '钉钉';
-  else if (/AlipayClient/i.test(ua)) app = '支付宝';
-  else if (/Weibo/i.test(ua)) app = '微博';
-
-  let browser = '';
-  if (/Edg\//i.test(ua)) browser = 'Edge';
-  else if (/OPR\//i.test(ua)) browser = 'Opera';
-  else if (/Firefox\//i.test(ua)) browser = 'Firefox';
-  else if (/Chrome\//i.test(ua)) browser = 'Chrome';
-  else if (/Safari\//i.test(ua)) browser = 'Safari';
-
-  const parts = [os, app || browser].filter(Boolean);
-  const text = parts.join(' · ');
-  return text.slice(0, 40) || (ua ? '未知设备' : '');
 }
 
-function geoOf(request, body) {
-  const cf = (request && request.cf) || {};
-  const ip = request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || '';
-  const parts = [];
-  if (cf.country) parts.push(cf.country === 'CN' ? '中国' : String(cf.country));
-  if (cf.region) parts.push(String(cf.region));
-  if (cf.city) parts.push(String(cf.city));
-  const location = parts.join(' ');
-  let referer = '';
-  if (typeof body.referer === 'string') referer = body.referer.slice(0, 200);
-  if (!referer) referer = (request.headers.get('referer') || '').slice(0, 200);
-  if (referer && referer.includes('same-origin')) referer = '';
-  return {
-    ip: String(ip || '').split(',')[0].trim().slice(0, 64),
-    location: location.slice(0, 80),
-    referer,
-    device: deviceOf(request, body),
-  };
-}
-
-
-async function handleSession(request, env) {
-  const body = await safeBody(request);
-  const token = typeof body.token === 'string' ? body.token.trim() : '';
-  const name = (typeof body.name === 'string' ? body.name : '').trim().slice(0, 24);
-
-  const s = await getSettings(env);
-  const shop = s.shop_name || '在线客服';
-  const geo = geoOf(request, body);
-
-  if (token) {
-    const conv = await env.DB.prepare('SELECT * FROM conversations WHERE visitor_token = ?').bind(token).first();
-    if (conv) {
-      const t = now();
-      if (name && name !== conv.visitor_name) {
-        await env.DB.prepare('UPDATE conversations SET visitor_name = ?, updated_at = ? WHERE id = ?')
-          .bind(name, t, conv.id)
-          .run();
-        conv.visitor_name = name;
-      }
-      const patch = { visitor_seen_at: t };
-      if (!conv.geo_ip && geo.ip) patch.geo_ip = geo.ip;
-      if (!conv.geo_location && geo.location) patch.geo_location = geo.location;
-      const keepReferer = conv.geo_referer && !conv.geo_referer.includes('localhost');
-      if (!keepReferer && geo.referer) patch.geo_referer = geo.referer;
-      if (!conv.geo_device && geo.device) patch.geo_device = geo.device;
-      const sets = Object.keys(patch)
-        .map((k) => `${k} = ?`)
-        .join(', ');
-      await env.DB.prepare(`UPDATE conversations SET ${sets} WHERE id = ?`)
-        .bind(...Object.values(patch), conv.id)
-        .run();
-      return json({
-        token,
-        conv: {
-          id: conv.id,
-          name: conv.visitor_name || '访客',
-          visitorName: conv.visitor_name || '访客',
-          remark: '',
-          preview: conv.last_preview || '',
-          lastMessageAt: conv.last_message_at || conv.created_at,
-          createdAt: conv.created_at,
-          unread: 0,
-          device: conv.geo_device || geo.device || '',
-          blocked: !!conv.blocked,
-        },
-        blocked: !!conv.blocked,
-        shop,
-        welcome: { enabled: s.welcome_enabled === '1', text: s.welcome_text },
-        contactEnabled: s.contact_enabled === '1',
-      });
-    }
-  }
-
-  const newToken = token || uid(40);
-  const id = uid(16);
-  const t = now();
-  const visitorName = name || '访客';
-
-  await env.DB.prepare(
-    'INSERT INTO conversations (id, visitor_token, visitor_name, created_at, updated_at, visitor_seen_at, geo_ip, geo_location, geo_referer, geo_device) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  )
-    .bind(id, newToken, visitorName, t, t, t, geo.ip || null, geo.location || null, geo.referer || null, geo.device || null)
-    .run();
-
-  // 自动欢迎语：只在新会话时发一条
-  let preview = '';
-  if (s.welcome_enabled === '1' && (s.welcome_text || '').trim()) {
-    try {
-      await env.DB.prepare(
-        `INSERT INTO messages (conv_id, sender, sender_name, type, body, created_at, updated_at)
-         VALUES (?, 'agent', ?, 'text', ?, ?, ?)`
-      )
-        .bind(id, s.welcome_from || '客服', s.welcome_text.trim().slice(0, 500), t, t)
-        .run();
-      preview = `客服: ${s.welcome_text.trim().slice(0, 40)}`;
-      await env.DB.prepare(
-        'UPDATE conversations SET last_message_at = ?, last_preview = ?, updated_at = ? WHERE id = ?'
-      )
-        .bind(t, preview, t, id)
-        .run();
-    } catch (e) {
-      console.error('welcome insert failed', e);
-    }
-  }
-
-  return json({
-    token: newToken,
-    conv: { id, name: visitorName, visitorName, remark: '', preview, lastMessageAt: t, createdAt: t, unread: 0, device: geo.device || '', blocked: false },
-    blocked: false,
-    shop,
-    welcome: { enabled: s.welcome_enabled === '1', text: s.welcome_text },
-    contactEnabled: s.contact_enabled === '1',
-  });
-}
-
-async function handleConversationList(env) {
-  const { results } = await env.DB.prepare(
-    `SELECT c.*, (
-       SELECT COUNT(*) FROM messages m
-       WHERE m.conv_id = c.id AND m.sender = 'visitor'
-         AND m.read_at IS NULL AND m.deleted_agent = 0 AND m.status = 'active'
-     ) AS unread, (
-       SELECT MAX(m.created_at) FROM messages m
-       WHERE m.conv_id = c.id AND m.sender = 'visitor' AND m.status = 'active'
-     ) AS last_visitor_at
-     FROM conversations c
-     ORDER BY COALESCE(c.last_message_at, c.created_at) DESC
-     LIMIT 100`
-  ).all();
-
-  return json({ conversations: (results || []).map(mapConv) });
-}
-
-async function handleDeleteConversation(request, env, convId) {
-  const ident = await identify(request, env);
-  if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
-
-  const body = await safeBody(request);
-  const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
-  if (!conv) return fail('会话不存在或已被删除', 404, 'not_found');
-
-  // 双重确认：前端会传 confirm:true，缺了就不删，防手滑
-  if (!body.confirm) return fail('需要二次确认才能删除会话', 400, 'need_confirm');
-
-  const filesRes = await env.DB.prepare(
-    "SELECT file_key FROM messages WHERE conv_id = ? AND file_key IS NOT NULL AND file_key <> ''"
-  )
-    .bind(convId)
-    .all();
-  const keys = ((filesRes && filesRes.results) || []).map((r) => r.file_key).filter(Boolean);
-  for (const key of keys) await removeStoredFile(env, key);
-
-  const msgs = await env.DB.prepare('DELETE FROM messages WHERE conv_id = ?').bind(convId).run();
-  const convRes = await env.DB.prepare('DELETE FROM conversations WHERE id = ?').bind(convId).run();
-  pushCooldown.delete(convId);
-
-  return json({
-    ok: true,
-    id: convId,
-    messages: (msgs.meta && msgs.meta.changes) || 0,
-    files: keys.length,
-    conversations: (convRes.meta && convRes.meta.changes) || 0,
-  });
-}
-
-async function handleBlock(request, env, convId) {
-  const ident = await identify(request, env);
-  if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
-
-  const body = await safeBody(request);
-  const blocked = body.blocked === undefined ? true : !!body.blocked;
-  await env.DB.prepare('UPDATE conversations SET blocked = ?, updated_at = ? WHERE id = ?')
-    .bind(blocked ? 1 : 0, now(), convId)
-    .run();
-
-  if (blocked) {
-    pushCooldown.delete(convId);
-  }
-  return json({ ok: true, blocked });
-}
-
-async function handleRemark(request, env, convId) {
-  const ident = await identify(request, env);
-  if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
-
-  const body = await safeBody(request);
-  const remark = String(body.remark !== undefined ? body.remark : body.name || '')
-    .trim()
-    .slice(0, 24);
-
-  const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
-  if (!conv) return fail('会话不存在', 404, 'not_found');
-
-  await env.DB.prepare('UPDATE conversations SET remark = ?, updated_at = ? WHERE id = ?')
-    .bind(remark, now(), convId)
-    .run();
-
-  return json({ ok: true, id: convId, remark, name: remark || conv.visitor_name || '访客' });
-}
-
-/* --------------------------------- 消息 --------------------------------- */
-
-const mapMessage = (row) => ({
-  id: row.id,
-  convId: row.conv_id,
-  sender: row.sender,
-  senderName: row.sender_name || (row.sender === 'agent' ? '客服' : '访客'),
-  type: row.type,
-  body: row.body || '',
-  fileKey: row.file_key || '',
-  fileSize: row.file_size || 0,
-  status: row.status || 'active',
-  autoReply: !!row.auto_reply,
-  createdAt: row.created_at,
-  updatedAt: row.updated_at,
-  readAt: row.read_at || 0,
-});
-
-async function handleListMessages(request, env, url) {
-  const ident = await identify(request, env);
-  if (!ident) return fail('未登录', 401, 'unauthorized');
-
-  const convId = await resolveConvId(request, ident, url, null);
-  if (!convId) return fail('缺少会话标识', 400, 'missing_conv');
-  if (ident.role === 'visitor' && convId !== ident.convId) return fail('无权访问该会话', 403, 'forbidden');
-
-  const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
-  if (!conv) return fail('会话不存在', 404, 'not_found');
-
-  const after = Number(url.searchParams.get('after') || 0) || 0;
-  const since = Number(url.searchParams.get('since') || 0) || 0;
-  const limit = 200;
-  const hideColumn = ident.role === 'visitor' ? 'deleted_visitor' : 'deleted_agent';
-
-  const fresh = await env.DB.prepare(
-    `SELECT * FROM messages WHERE conv_id = ? AND id > ? AND ${hideColumn} = 0 ORDER BY id ASC LIMIT ?`
-  )
-    .bind(convId, after, limit)
-    .all();
-
-  let updates = [];
-  if (since > 0) {
-    const res = await env.DB.prepare(
-      `SELECT * FROM messages
-       WHERE conv_id = ? AND updated_at > ? AND id <= ? AND ${hideColumn} = 0
-       ORDER BY id ASC LIMIT ?`
-    )
-      .bind(convId, since, after, limit)
-      .all();
-    updates = res.results || [];
-  }
-
-  const unreadRow = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM messages
-     WHERE conv_id = ? AND sender <> ? AND read_at IS NULL AND ${hideColumn} = 0 AND status = 'active'`
-  )
-    .bind(convId, ident.role)
-    .first();
-
-  // 在线状态心跳：最多 1 分钟写一次，省 D1 写入额度
-  const seenCol = ident.role === 'visitor' ? 'visitor_seen_at' : 'agent_seen_at';
-  if (now() - (conv[seenCol] || 0) > 60 * 1000) {
-    try {
-      await env.DB.prepare(`UPDATE conversations SET ${seenCol} = ? WHERE id = ?`).bind(now(), convId).run();
-    } catch {
-      /* 忽略 */
-    }
-  }
-
-  return json({
-    messages: (fresh.results || []).map(mapMessage),
-    updates: updates.map(mapMessage),
-    conv: {
-      id: conv.id,
-      name: conv.visitor_name || '访客',
-      remark: conv.remark || '',
-      unread: (unreadRow && unreadRow.n) || 0,
-      lastReadAt: ident.role === 'visitor' ? conv.visitor_last_read_at : conv.agent_last_read_at,
-    },
-    now: now(),
-  });
-}
-
-function parseRules(raw) {
-  try {
-    const arr = JSON.parse(raw || '[]');
-    if (!Array.isArray(arr)) return [];
-    return arr
-      .filter((x) => x && String(x.k || '').trim())
-      .map((x) => ({ k: String(x.k).trim().slice(0, 30), r: String(x.r || '').slice(0, 300) }))
-      .slice(0, 60);
-  } catch {
-    return [];
-  }
-}
-
-function matchRule(rules, text) {
-  const lower = String(text || '').toLowerCase();
-  for (const rule of rules) {
-    if (!rule.r) continue;
-    if (lower.includes(rule.k.toLowerCase())) return rule;
+// ---------- 关键词自动回复 ----------
+function matchKeywords(s, text, online) {
+  let list = [];
+  try { list = JSON.parse(online ? s.keywords_online : s.keywords_offline) || []; } catch { list = []; }
+  for (const item of list) {
+    if (!item || !item.kw) continue;
+    if (text.includes(String(item.kw))) return item.reply || '';
   }
   return null;
 }
 
-const pushCooldown = new Map();
-
-const plainOf = (lines) =>
-  lines
-    .join('\n')
-    .replace(/\*\*/g, '');
-
-async function pushWeChat(env, conv, text) {
-  if (conv && conv.blocked) return;
-  const s = await getSettings(env);
-  if (s.wechat_push_enabled !== '1') return;
-
-  const last = pushCooldown.get(conv.id) || 0;
-  if (now() - last < 5000) return;
-  pushCooldown.set(conv.id, now());
-
-  const c = parseContact(conv.contact);
-  const contactText = c
-    ? [
-        c.phone && '手机 ' + c.phone,
-        c.wechat && '微信 ' + c.wechat,
-        c.qq && 'QQ ' + c.qq,
-        c.email && '邮箱 ' + c.email,
-      ]
-        .filter(Boolean)
-        .join(' / ')
-    : '';
-
-  const title = '收到新的访客消息';
-  const lines = [
-    `**访客IP**：${conv.geo_ip || '未知'}`,
-    `**位置**：${conv.geo_location || '未知'}`,
-    conv.geo_referer ? `**来源**：${conv.geo_referer}` : '',
-    contactText ? `**联系方式**：${contactText}` : '',
-    `**消息**：${String(text || '').slice(0, 300)}`,
-  ].filter(Boolean);
-
-  const plain = plainOf(lines);
-  const html = lines.map((l) => l.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')).join('<br>');
-
-  const jobs = [];
-
-  const sendServerChan = String(s.wechat_sendkey || '').trim();
-  if (sendServerChan) {
-    jobs.push(
-      fetch(`https://sctapi.ftqq.com/${encodeURIComponent(sendServerChan)}.send`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ title, desp: lines.join('\n\n') }).toString(),
-      })
-    );
+// ---------- 推送五渠道 ----------
+async function pushNotify(env, s, conv, text) {
+  const title = `【${s.shop_name || '在线客服'}】新咨询`;
+  const body = `会话#${conv.id} ${conv.visitor_name || '访客'}：${text}`;
+  const tasks = [];
+  if (s.push_serverchan) {
+    tasks.push(fetch(`https://sctapi.ftqq.com/${s.push_serverchan}.send`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, desp: body }),
+    }).catch(() => {}));
   }
-
-  const pushplus = String(s.pushplus_token || '').trim();
-  if (pushplus) {
-    jobs.push(
-      fetch('https://www.pushplus.plus/send', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ token: pushplus, title, content: html, template: 'html' }),
-      })
-    );
+  if (s.push_pushplus) {
+    tasks.push(fetch('http://www.pushplus.plus/send', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: s.push_pushplus, title, content: body }),
+    }).catch(() => {}));
   }
-
-  const ding = String(s.dingtalk_webhook || '').trim();
-  if (ding) {
-    jobs.push(
-      fetch(ding, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          msgtype: 'markdown',
-          markdown: { title, text: lines.join('\n\n') },
-        }),
-      })
-    );
+  if (s.push_dingtalk) {
+    tasks.push(fetch(s.push_dingtalk, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ msgtype: 'text', text: { content: body } }),
+    }).catch(() => {}));
   }
-
-  const wecom = String(s.wecom_webhook || '').trim();
-  if (wecom) {
-    jobs.push(
-      fetch(wecom, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ msgtype: 'text', text: { content: plain } }),
-      })
-    );
+  if (s.push_wecom) {
+    tasks.push(fetch(s.push_wecom, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ msgtype: 'text', text: { content: body } }),
+    }).catch(() => {}));
   }
-
-  const bark = String(s.bark_url || '').trim();
-  if (bark) {
-    const base = bark.replace(/\/+$/, '');
-    const url = `${base}/${encodeURIComponent(title)}/${encodeURIComponent(plain.slice(0, 900))}?group=客服消息`;
-    jobs.push(fetch(url));
+  if (s.push_bark) {
+    tasks.push(fetch(`${s.push_bark}/${encodeURIComponent(title)}/${encodeURIComponent(body)}`).catch(() => {}));
   }
-
-  if (!jobs.length) return;
-
-  await Promise.all(
-    jobs.map((p) =>
-      Promise.resolve(p)
-        .then((res) => {
-          if (!res || !res.ok) console.warn('push status', res && res.status);
-        })
-        .catch((e) => console.warn('push failed', String(e && e.message)))
-    )
-  );
+  await Promise.allSettled(tasks);
 }
 
-const fmtTime = (ts) => {
-  if (!ts) return '';
-  const d = new Date(Number(ts) + 8 * 3600 * 1000);
-  return d.toISOString().slice(0, 19).replace('T', ' ');
-};
-
-const csvCell = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
-
-async function handleContact(request, env) {
-  const ident = await identify(request, env);
-  if (!ident || ident.role !== 'visitor') return fail('未登录', 401, 'unauthorized');
-
-  const s = await getSettings(env);
-  if (s.contact_enabled !== '1') return fail('未开启联系方式收集', 403, 'disabled');
-
-  const convRow = await env.DB.prepare('SELECT blocked FROM conversations WHERE id = ?').bind(ident.convId).first();
-  if (convRow && convRow.blocked) return fail('本次对话已被客服关闭', 403, 'blocked');
-
-  const body = await safeBody(request);
-  const phone = String(body.phone || '').trim().slice(0, 20);
-  const wechat = String(body.wechat || '').trim().slice(0, 40);
-  const qq = String(body.qq || '').trim().slice(0, 20);
-  const email = String(body.email || '').trim().slice(0, 60);
-
-  if (!phone && !wechat && !qq && !email) return fail('请至少填写一项联系方式', 400, 'empty_contact');
-  if (phone && !/^[0-9+\-\s]{6,20}$/.test(phone)) return fail('手机号格式不太对', 400, 'invalid_phone');
-  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return fail('邮箱格式不太对', 400, 'invalid_email');
-
-  const contact = { phone, wechat, qq, email, at: now() };
-  await env.DB.prepare('UPDATE conversations SET contact = ?, updated_at = ? WHERE id = ?')
-    .bind(JSON.stringify(contact), now(), ident.convId)
-    .run();
-  return json({ ok: true, contact });
-}
-
-async function handleExport(request, env, url) {
-  const ident = await identify(request, env);
-  if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
-
-  const convId = url.searchParams.get('conv') || '';
-  let convs = [];
-  if (convId) {
-    const c = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
-    convs = c ? [c] : [];
-  } else {
-    const r = await env.DB.prepare(
-      'SELECT * FROM conversations ORDER BY COALESCE(last_message_at, created_at) DESC LIMIT 100'
-    ).all();
-    convs = r.results || [];
-  }
-  if (!convs.length) return fail('没有可导出的会话', 404, 'no_conv');
-
-  const rows = [
-    [
-      '会话ID',
-      '顾客备注',
-      '会话创建时间',
-      '访客IP',
-      '归属地',
-      '来源网站',
-      '联系方式',
-      '消息时间',
-      '发送方',
-      '内容类型',
-      '内容',
-      '是否自动回复',
-      '已读状态',
-    ],
-  ];
-
-  for (const c of convs) {
-    const contact = parseContact(c.contact);
-    const contactText = contact
-      ? [
-          contact.phone && '手机:' + contact.phone,
-          contact.wechat && '微信:' + contact.wechat,
-          contact.qq && 'QQ:' + contact.qq,
-          contact.email && '邮箱:' + contact.email,
-        ]
-          .filter(Boolean)
-          .join(' / ')
-      : '';
-    const { results } = await env.DB.prepare(
-      `SELECT * FROM messages WHERE conv_id = ? AND status = 'active' ORDER BY id ASC LIMIT 2000`
-    )
-      .bind(c.id)
-      .all();
-    const msgs = results || [];
-    const base = [
-      c.id,
-      c.remark || '',
-      fmtTime(c.created_at),
-      c.geo_ip || '',
-      c.geo_location || '',
-      c.geo_referer || '',
-      contactText,
-    ];
-    if (!msgs.length) {
-      rows.push([...base, '', '（暂无消息）', '', '', '', '']);
-      continue;
-    }
-    for (const m of msgs) {
-      rows.push([
-        ...base,
-        fmtTime(m.created_at),
-        m.sender === 'agent' ? '客服' : '访客',
-        m.type === 'image' ? '图片' : '文字',
-        m.type === 'image' ? '/api/file/' + (m.file_key || '') : m.body || '',
-        m.auto_reply ? '是' : '否',
-        m.read_at ? '已读' : '未读',
-      ]);
-    }
-  }
-
-  const csv = '\ufeff' + rows.map((r) => r.map(csvCell).join(',')).join('\r\n');
-  const name = convId ? `聊天记录-${convId}.csv` : `聊天记录-全部-${fmtTime(now()).slice(0, 10)}.csv`;
-  return new Response(csv, {
-    headers: {
-      'content-type': 'text/csv; charset=utf-8',
-      'content-disposition': `attachment; filename="chat-log.csv"; filename*=UTF-8''${encodeURIComponent(name)}`,
-      'cache-control': 'no-store',
-    },
-  });
-}
-
-async function handleSendMessage(request, env, url, ctx) {
-  const ident = await identify(request, env);
-  if (!ident) return fail('未登录', 401, 'unauthorized');
-
-  const body = await safeBody(request);
-  const convId = await resolveConvId(request, ident, url, body);
-  if (!convId) return fail('缺少会话标识', 400, 'missing_conv');
-  if (ident.role === 'visitor' && convId !== ident.convId) return fail('无权访问该会话', 403, 'forbidden');
-
-  const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
-  if (!conv) return fail('会话不存在', 404, 'not_found');
-  if (ident.role === 'visitor' && conv.blocked) {
-    return fail('本次对话已被客服关闭，暂时无法发送消息', 403, 'blocked');
-  }
-
-  const type = body.type === 'image' ? 'image' : 'text';
-  const text = String(body.body || '').trim();
-  let fileKey = '';
-
-  if (type === 'text') {
-    if (!text) return fail('消息内容不能为空', 400, 'empty');
-    if (text.length > MAX_TEXT_LEN) return fail(`消息过长（最多 ${MAX_TEXT_LEN} 字）`, 400, 'too_long');
-  } else {
-    fileKey = String(body.fileKey || '').trim();
-    if (!fileKey || !fileKey.startsWith(`${convId}/`)) return fail('图片标识无效', 400, 'invalid_file');
-    const file = await env.DB.prepare('SELECT id FROM files WHERE id = ?').bind(fileKey).first();
-    if (!file && !env.BUCKET) return fail('图片不存在，请重新上传', 400, 'invalid_file');
-  }
-
+// ---------- 会话/消息写入 ----------
+async function insertMessage(env, convId, fields) {
   const t = now();
-  const preview = type === 'image' ? '[图片]' : text.slice(0, 40);
-  const senderName = ident.role === 'agent' ? ident.name : conv.visitor_name || '访客';
-
-  const res = await env.DB.prepare(
-    `INSERT INTO messages (conv_id, sender, sender_name, type, body, file_key, file_size, status, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
-  )
-    .bind(convId, ident.role, senderName, type, text, type === 'image' ? fileKey : null, Number(body.fileSize) || 0, t, t)
-    .run();
-
-  const id = Number(res.meta && res.meta.last_row_id) || 0;
-  const row = await env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(id).first();
-
-  await env.DB.prepare(
-    'UPDATE conversations SET last_message_at = ?, last_preview = ?, updated_at = ? WHERE id = ?'
-  )
-    .bind(t, `${ident.role === 'agent' ? '客服: ' : ''}${preview}`, t, convId)
-    .run();
-
-  let autoReply = null;
-
-  if (ident.role === 'visitor' && type === 'text') {
-    const s2 = await getSettings(env);
-    const online = s2.agent_online === '1';
-    const enabled = online ? s2.auto_reply_enabled === '1' : s2.offline_reply_enabled === '1';
-    if (enabled) {
-      const rules = parseRules(online ? s2.keywords : s2.offline_keywords);
-      const hit = matchRule(rules, text);
-      if (hit && hit.r) {
-        try {
-          const t2 = now();
-          const ins = await env.DB.prepare(
-            `INSERT INTO messages (conv_id, sender, sender_name, type, body, created_at, updated_at, auto_reply)
-             VALUES (?, 'agent', ?, 'text', ?, ?, ?, 1)`
-          )
-            .bind(convId, s2.welcome_from || '客服', hit.r, t2, t2)
-            .run();
-          const rid = Number(ins.meta && ins.meta.last_row_id) || 0;
-          const row2 = await env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(rid).first();
-          autoReply = row2 ? mapMessage(row2) : null;
-          await env.DB.prepare(
-            'UPDATE conversations SET last_message_at = ?, last_preview = ?, updated_at = ? WHERE id = ?'
-          )
-            .bind(t2, `客服: ${hit.r.slice(0, 40)}`, t2, convId)
-            .run();
-        } catch (e) {
-          console.error('auto reply failed', e);
-        }
-      }
-    }
-    const job = pushWeChat(env, conv, preview);
-    if (ctx && ctx.waitUntil) ctx.waitUntil(job.catch(() => {}));
-  }
-
-  return json({ message: row ? mapMessage(row) : null, id, autoReply });
-}
-
-async function handleMessageAction(request, env, id, action) {
-  const ident = await identify(request, env);
-  if (!ident) return fail('未登录', 401, 'unauthorized');
-
-  const msg = await env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(id).first();
-  if (!msg) return fail('消息不存在', 404, 'not_found');
-  if (ident.role === 'visitor' && msg.conv_id !== ident.convId) return fail('无权操作该消息', 403, 'forbidden');
-
-  const hideColumn = ident.role === 'visitor' ? 'deleted_visitor' : 'deleted_agent';
-  const t = now();
-
-  if (action === 'delete') {
-    await env.DB.prepare(`UPDATE messages SET ${hideColumn} = 1, updated_at = ? WHERE id = ?`).bind(t, id).run();
-    return json({ ok: true, id, action: 'delete' });
-  }
-
-  if (msg.sender !== ident.role) return fail('只能撤回自己发送的消息', 403, 'forbidden');
-  if (msg.status === 'recalled') return json({ ok: true, id, status: 'recalled' });
-
-  const windowSec = Number(env.RECALL_WINDOW_SEC || 120);
-  if (t - msg.created_at > windowSec * 1000) return fail(`超过 ${windowSec} 秒，无法撤回`, 400, 'recall_expired');
-
-  await env.DB.prepare(
-    `UPDATE messages SET status = 'recalled', body = '', file_key = NULL, updated_at = ? WHERE id = ?`
-  )
-    .bind(t, id)
-    .run();
-
-  await env.DB.prepare('UPDATE conversations SET last_preview = ?, updated_at = ? WHERE id = ? AND last_message_at <= ?')
-    .bind('[消息已撤回]', t, msg.conv_id, msg.created_at)
-    .run();
-
-  return json({ ok: true, id, action: 'recall', status: 'recalled' });
-}
-
-async function handleRead(request, env, url) {
-  const ident = await identify(request, env);
-  if (!ident) return fail('未登录', 401, 'unauthorized');
-
-  const body = await safeBody(request);
-  const convId = await resolveConvId(request, ident, url, body);
-  if (!convId) return fail('缺少会话标识', 400, 'missing_conv');
-  if (ident.role === 'visitor' && convId !== ident.convId) return fail('无权访问该会话', 403, 'forbidden');
-
-  const t = now();
-  await env.DB.prepare(
-    `UPDATE messages SET read_at = ?, updated_at = ?
-     WHERE conv_id = ? AND sender <> ? AND read_at IS NULL AND status = 'active'`
-  )
-    .bind(t, t, convId, ident.role)
-    .run();
-
-  const col = ident.role === 'visitor' ? 'visitor_last_read_at' : 'agent_last_read_at';
-  await env.DB.prepare(`UPDATE conversations SET ${col} = ?, updated_at = ? WHERE id = ?`)
-    .bind(t, t, convId)
-    .run();
-
-  return json({ ok: true, readAt: t });
-}
-
-/* --------------------------------- 图片 --------------------------------- */
-
-async function storeImageBuffer(env, key, mime, buffer) {
-  if (env.BUCKET) {
-    try {
-      await env.BUCKET.put(key, buffer, {
-        httpMetadata: { contentType: mime, cacheControl: 'public, max-age=31536000, immutable' },
-      });
-      return 'r2';
-    } catch (e) {
-      console.warn('R2 put failed, fallback to D1:', String(e && e.message));
-    }
-  }
-  if (buffer.byteLength > D1_MAX_FILE_BYTES) return 'too_large';
-  await env.DB.prepare('INSERT INTO files (id, mime, size, data, created_at) VALUES (?, ?, ?, ?, ?)')
-    .bind(key, mime, buffer.byteLength, bytesToBase64(buffer), now())
-    .run();
-  return 'd1';
-}
-
-async function removeStoredFile(env, key) {
-  if (!key) return;
-  if (env.BUCKET) {
-    try {
-      await env.BUCKET.delete(key);
-    } catch (e) {
-      console.warn('R2 delete failed:', String(e && e.message));
-    }
-  }
-  await env.DB.prepare('DELETE FROM files WHERE id = ?').bind(key).run();
-}
-
-async function serveStoredFile(env, key) {
-  const commonHeaders = {
-    'cache-control': 'public, max-age=31536000, immutable',
-    'x-content-type-options': 'nosniff',
+  const defaults = {
+    sender: 'visitor', sender_name: '', type: 'text', body: '', file_key: '', file_size: 0,
+    status: 'sent', deleted_visitor: 0, deleted_agent: 0, read_at: null,
+    created_at: t, updated_at: t, auto_reply: 0, ai_reply: 0,
   };
-  if (env.BUCKET) {
+  const f = { ...defaults, ...fields };
+  const r = await env.DB.prepare(
+    `INSERT INTO messages (conv_id, sender, sender_name, type, body, file_key, file_size, status,
+      deleted_visitor, deleted_agent, read_at, created_at, updated_at, auto_reply, ai_reply)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(convId, f.sender, f.sender_name, f.type, f.body, f.file_key, f.file_size, f.status,
+    f.deleted_visitor, f.deleted_agent, f.read_at, f.created_at, f.updated_at, f.auto_reply, f.ai_reply).run();
+  return r.meta.last_row_id;
+}
+
+async function touchConv(env, conv, preview) {
+  const t = now();
+  await env.DB.prepare('UPDATE conversations SET last_message_at=?, last_preview=?, updated_at=? WHERE id=?')
+    .bind(t, preview, t, conv.id).run();
+}
+
+// ---------- 路由 ----------
+export default {
+  async fetch(request, env, ctx) {
+    await ensureSchema(env);
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
     try {
-      const obj = await env.BUCKET.get(key);
-      if (obj) {
-        const headers = new Headers(commonHeaders);
-        obj.writeHttpMetadata(headers);
-        headers.set('etag', obj.httpEtag);
-        return new Response(obj.body, { headers });
+      // 健康检查（无需鉴权）
+      if (path === '/api/health' && method === 'GET') {
+        return json({
+          version: VERSION,
+          ok: true,
+          features: [
+            '访客会话与轮询收发', '关键词在线/离线自动回复', '五渠道推送', '提示音',
+            '文件图片上传落D1', '联系方式', '导出CSV', '网站嵌入', '设备/IP识别', '拉黑', '删除会话',
+            '同IP客户归并与一键合并/拆分', 'AI托管智能回复', '对话结束语（结束/重新打开）', '视频/语音外部链接面板',
+          ],
+        });
       }
+
+      // 静态资源（生产由 wrangler assets 提供；本地自测由 server.mjs 提供）
+      if (method === 'GET' && (path === '/' || path === '/index.html' || path === '/agent.html' || path.startsWith('/assets/') || path === '/embed.js')) {
+        if (env.ASSETS) {
+          const asset = await env.ASSETS.fetch(request);
+          if (asset && asset.status !== 404) return asset;
+        }
+        return text('Not found', 404);
+      }
+
+      // ---------- 访客会话 ----------
+      if (path === '/api/session' && method === 'POST') {
+        const body = await readBody(request);
+        const s = await getSettings(env);
+        const ip = clientIp(request);
+        let conv = null;
+        if (body.token) {
+          conv = await env.DB.prepare('SELECT * FROM conversations WHERE visitor_token = ? ORDER BY id DESC LIMIT 1')
+            .bind(body.token).first();
+        }
+        if (!conv) {
+          const token = body.token || ('v_' + Math.random().toString(36).slice(2, 12) + Date.now().toString(36));
+          const t = now();
+          const r = await env.DB.prepare(
+            `INSERT INTO conversations (visitor_token, visitor_name, created_at, updated_at, last_message_at, last_preview, geo_ip, geo_referer, geo_device, status)
+             VALUES (?,?,?,?,?,?,?,?,?, 'open')`
+          ).bind(token, body.name || '', t, t, t, '', ip, body.referer || '', body.device || '').run();
+          const convId = r.meta.last_row_id;
+          await insertMessage(env, convId, {
+            sender: 'agent', sender_name: s.agent_name, body: s.welcome_message, auto_reply: 1, status: 'read',
+          });
+          conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
+          return json({ ok: true, token, conv, settings: publicSettings(s), welcome: s.welcome_message });
+        }
+        return json({ ok: true, token: conv.visitor_token, conv, settings: publicSettings(s) });
+      }
+
+      // ---------- 消息 ----------
+      if (path === '/api/messages' && method === 'GET') {
+        const convId = Number(url.searchParams.get('conv'));
+        const token = bearer(request) || parseCookies(request).visitor_token || '';
+        const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
+        if (!conv) return json({ error: '会话不存在' }, 404);
+        const isAgent = await requireAgent(request, env);
+        if (!isAgent && conv.visitor_token !== token) return json({ error: '无权访问' }, 403);
+
+        const after = Number(url.searchParams.get('after') || 0);
+        const since = url.searchParams.get('since') || '0';
+        let rows;
+        if (after > 0) {
+          rows = await env.DB.prepare(
+            'SELECT * FROM messages WHERE conv_id = ? AND id > ? AND deleted_visitor = 0 ORDER BY id ASC'
+          ).bind(convId, after).all();
+        } else {
+          rows = await env.DB.prepare(
+            'SELECT * FROM messages WHERE conv_id = ? AND deleted_visitor = 0 ORDER BY id ASC LIMIT 200'
+          ).bind(convId).all();
+        }
+        const updates = await env.DB.prepare(
+          'SELECT id, status, read_at, updated_at, deleted_visitor, deleted_agent FROM messages WHERE conv_id = ? AND updated_at > ? ORDER BY id ASC'
+        ).bind(convId, since).all();
+        const s = await getSettings(env);
+        return json({
+          messages: rows.results,
+          updates: updates.results,
+          conv: { id: conv.id, status: conv.status, blocked: conv.blocked, last_preview: conv.last_preview },
+          settings: publicSettings(s),
+        });
+      }
+
+      if (path === '/api/messages' && method === 'POST') {
+        const body = await readBody(request);
+        const s = await getSettings(env);
+        const convId = Number(body.conv);
+        const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
+        if (!conv) return json({ error: '会话不存在' }, 404);
+        const isAgent = await requireAgent(request, env);
+        const token = bearer(request) || parseCookies(request).visitor_token || '';
+
+        if (isAgent) {
+          // 客服发送（文本/链接卡片）
+          const type = body.type || 'text';
+          if (type === 'link') {
+            const urlStr = String(body.url || '');
+            if (!/^https?:\/\//i.test(urlStr)) return json({ error: '链接必须以 http:// 或 https:// 开头' }, 400);
+            if (String(body.title || '').length > 60) return json({ error: '标题过长（最多60字）' }, 400);
+            const mid = await insertMessage(env, convId, {
+              sender: 'agent', sender_name: s.agent_name, type: 'link',
+              body: JSON.stringify({ title: body.title || '会议链接', url: urlStr }), status: 'read',
+            });
+            await touchConv(env, conv, `[链接]${body.title || '会议链接'}`);
+            return json({ ok: true, id: mid });
+          }
+          const textBody = String(body.body || '').trim();
+          if (!textBody) return json({ error: '内容为空' }, 400);
+          const mid = await insertMessage(env, convId, {
+            sender: 'agent', sender_name: s.agent_name, body: textBody, status: 'read',
+          });
+          await touchConv(env, conv, textBody);
+          return json({ ok: true, id: mid });
+        }
+
+        // 访客发送
+        if (conv.visitor_token !== token) return json({ error: '无权访问' }, 403);
+        if (conv.blocked) return json({ ok: false, blocked: true, error: '您已被禁止发言' }, 403);
+
+        // 已结束会话：按 reopenable 决定是否自动重开
+        if (conv.status === 'closed') {
+          if (s.reopenable === '1') {
+            await env.DB.prepare("UPDATE conversations SET status='open', updated_at=? WHERE id=?").bind(now(), convId).run();
+          } else {
+            return json({ ok: false, closed: true, end_message: s.end_message }, 409);
+          }
+        }
+
+        const textBody = String(body.body || '').trim();
+        const fileKey = body.file_key || '';
+        if (!textBody && !fileKey) return json({ error: '内容为空' }, 400);
+        if (textBody.length > 2000) return json({ error: '消息过长（最多2000字）' }, 400);
+
+        const mid = await insertMessage(env, convId, {
+          sender: 'visitor', sender_name: conv.visitor_name || '访客',
+          body: textBody, file_key: fileKey, file_size: Number(body.file_size || 0),
+        });
+        await touchConv(env, conv, textBody || '[图片]');
+
+        let handled = false; // 已被自动回复/AI接管，不再响铃推送
+
+        // 1) 关键词自动回复（在线/离线两套）
+        if (s.auto_reply_enabled === '1' && textBody) {
+          const online = s.online_status === 'online';
+          const reply = matchKeywords(s, textBody, online);
+          if (reply) {
+            await insertMessage(env, convId, {
+              sender: 'agent', sender_name: s.agent_name, body: reply, auto_reply: 1, status: 'read',
+            });
+            await touchConv(env, conv, reply);
+            handled = true;
+          }
+        }
+
+        // 2) AI 托管智能回复
+        if (!handled && s.ai_enabled === '1' && !conv.blocked) {
+          const rounds = Math.max(1, Number(s.ai_max_rounds || 6));
+          const histRows = await env.DB.prepare(
+            'SELECT sender, body FROM messages WHERE conv_id = ? AND type = \'text\' AND deleted_visitor = 0 AND id < ? ORDER BY id DESC LIMIT ?'
+          ).bind(convId, mid, rounds * 2).all();
+          const history = histRows.results.reverse().map(r => ({
+            role: r.sender === 'agent' ? 'assistant' : 'user', content: r.body,
+          }));
+          const aiReply = await callAI(env, s, history, textBody);
+          if (aiReply) {
+            await insertMessage(env, convId, {
+              sender: 'agent', sender_name: s.agent_name, body: aiReply, ai_reply: 1, status: 'read',
+            });
+            await touchConv(env, conv, aiReply);
+            handled = true;
+          }
+          // AI 失败/超时静默回退到关键词规则（关键词已在上面尝试过），继续走人工
+        }
+
+        // 3) 未被接管：推送五渠道（AI/自动回复不推送、不响铃）
+        if (!handled) {
+          ctx.waitUntil ? ctx.waitUntil(pushNotify(env, s, conv, textBody || '[图片]')) : pushNotify(env, s, conv, textBody || '[图片]');
+        }
+        return json({ ok: true, id: mid, handled });
+      }
+
+      // 撤回 / 删除
+      if (path.match(/^\/api\/messages\/\d+\/(recall|delete)$/) && method === 'POST') {
+        const m = path.match(/^\/api\/messages\/(\d+)\/(recall|delete)$/);
+        const mid = Number(m[1]); const action = m[2];
+        const msg = await env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(mid).first();
+        if (!msg) return json({ error: '消息不存在' }, 404);
+        const isAgent = await requireAgent(request, env);
+        const token = bearer(request) || parseCookies(request).visitor_token || '';
+        const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(msg.conv_id).first();
+        if (!isAgent && conv.visitor_token !== token) return json({ error: '无权访问' }, 403);
+
+        if (action === 'recall') {
+          if (!isAgent && msg.sender !== 'visitor') return json({ error: '只能撤回自己的消息' }, 403);
+          await env.DB.prepare("UPDATE messages SET status='recalled', updated_at=? WHERE id=?").bind(now(), mid).run();
+          return json({ ok: true });
+        }
+        // delete：按侧软删除
+        const col = isAgent ? 'deleted_agent' : 'deleted_visitor';
+        await env.DB.prepare(`UPDATE messages SET ${col}=1, updated_at=? WHERE id=?`).bind(now(), mid).run();
+        return json({ ok: true });
+      }
+
+      // ---------- 客服会话列表 ----------
+      if (path === '/api/conversations' && method === 'GET') {
+        if (!(await requireAgent(request, env))) return json({ error: '未登录' }, 401);
+        const rows = await env.DB.prepare(
+          'SELECT * FROM conversations ORDER BY last_message_at DESC, id DESC'
+        ).all();
+        const list = rows.results;
+        // 同IP聚类统计（未合并、IP非空）
+        const ipGroups = {};
+        for (const c of list) {
+          if (c.geo_ip && !c.customer_id) {
+            ipGroups[c.geo_ip] = (ipGroups[c.geo_ip] || 0) + 1;
+          }
+        }
+        // 合并客户组统计
+        const custGroups = {};
+        for (const c of list) {
+          if (c.customer_id) {
+            if (!custGroups[c.customer_id]) custGroups[c.customer_id] = [];
+            custGroups[c.customer_id].push(c);
+          }
+        }
+        const out = [];
+        for (const c of list) {
+          const unread = (await env.DB.prepare(
+            "SELECT COUNT(*) AS n FROM messages m WHERE m.conv_id = ? AND m.sender='visitor' AND m.deleted_agent=0 AND m.created_at > COALESCE((SELECT agent_last_read_at FROM conversations WHERE id=?),'0000')"
+          ).bind(c.id, c.id).first()).n;
+          const item = { ...c, unread, groupCount: c.geo_ip ? (ipGroups[c.geo_ip] || 0) : 0 };
+          if (c.customer_id && custGroups[c.customer_id]) {
+            item.memberCount = custGroups[c.customer_id].length;
+            item.primaryId = Math.min(...custGroups[c.customer_id].map(x => x.id));
+          }
+          out.push(item);
+        }
+        return json({ ok: true, conversations: out });
+      }
+
+      // 备注
+      if (path.match(/^\/api\/conversations\/\d+\/remark$/) && method === 'POST') {
+        if (!(await requireAgent(request, env))) return json({ error: '未登录' }, 401);
+        const convId = Number(path.match(/\d+/)[0]);
+        const body = await readBody(request);
+        await env.DB.prepare('UPDATE conversations SET remark=?, updated_at=? WHERE id=?')
+          .bind(String(body.remark || '').slice(0, 100), now(), convId).run();
+        return json({ ok: true });
+      }
+
+      // 拉黑
+      if (path.match(/^\/api\/conversations\/\d+\/block$/) && method === 'POST') {
+        if (!(await requireAgent(request, env))) return json({ error: '未登录' }, 401);
+        const convId = Number(path.match(/\d+/)[0]);
+        const body = await readBody(request);
+        await env.DB.prepare('UPDATE conversations SET blocked=?, updated_at=? WHERE id=?')
+          .bind(body.blocked ? 1 : 0, now(), convId).run();
+        return json({ ok: true, blocked: !!body.blocked });
+      }
+
+      // 删除会话
+      if (path.match(/^\/api\/conversations\/\d+$/) && method === 'DELETE') {
+        if (!(await requireAgent(request, env))) return json({ error: '未登录' }, 401);
+        const convId = Number(path.match(/\d+/)[0]);
+        await env.DB.prepare('DELETE FROM messages WHERE conv_id=?').bind(convId).run();
+        await env.DB.prepare('DELETE FROM conversations WHERE id=?').bind(convId).run();
+        return json({ ok: true });
+      }
+
+      // ---------- 新功能1：同IP合并 / 拆分 ----------
+      if (path.match(/^\/api\/conversations\/\d+\/merge$/) && method === 'POST') {
+        if (!(await requireAgent(request, env))) return json({ error: '未登录' }, 401);
+        const convId = Number(path.match(/\d+/)[0]);
+        const body = await readBody(request);
+        const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id=?').bind(convId).first();
+        if (!conv) return json({ error: '会话不存在' }, 404);
+        if (!conv.geo_ip) return json({ error: '该会话无IP，无法按IP合并' }, 400);
+        const peers = await env.DB.prepare(
+          'SELECT * FROM conversations WHERE geo_ip=? AND customer_id IS NULL ORDER BY id ASC'
+        ).bind(conv.geo_ip).all();
+        if (peers.results.length < 2) return json({ error: '同IP会话不足2个，无需合并' }, 400);
+        const customerId = body.customer_id || ('cust_' + peers.results[0].id + '_' + Date.now().toString(36));
+        for (const p of peers.results) {
+          await env.DB.prepare('UPDATE conversations SET customer_id=?, updated_at=? WHERE id=?')
+            .bind(customerId, now(), p.id).run();
+        }
+        return json({ ok: true, customer_id: customerId, merged: peers.results.map(p => p.id) });
+      }
+
+      if (path.match(/^\/api\/conversations\/\d+\/split$/) && method === 'POST') {
+        if (!(await requireAgent(request, env))) return json({ error: '未登录' }, 401);
+        const convId = Number(path.match(/\d+/)[0]);
+        const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id=?').bind(convId).first();
+        if (!conv) return json({ error: '会话不存在' }, 404);
+        if (!conv.customer_id) return json({ error: '该会话未合并' }, 400);
+        await env.DB.prepare('UPDATE conversations SET customer_id=NULL, updated_at=? WHERE customer_id=?')
+          .bind(now(), conv.customer_id).run();
+        return json({ ok: true });
+      }
+
+      // ---------- 新功能3：结束对话 / 重新打开 ----------
+      if (path.match(/^\/api\/conversations\/\d+\/close$/) && method === 'POST') {
+        if (!(await requireAgent(request, env))) return json({ error: '未登录' }, 401);
+        const convId = Number(path.match(/\d+/)[0]);
+        await env.DB.prepare("UPDATE conversations SET status='closed', updated_at=? WHERE id=?").bind(now(), convId).run();
+        return json({ ok: true, status: 'closed' });
+      }
+
+      if (path.match(/^\/api\/conversations\/\d+\/reopen$/) && method === 'POST') {
+        if (!(await requireAgent(request, env))) return json({ error: '未登录' }, 401);
+        const convId = Number(path.match(/\d+/)[0]);
+        await env.DB.prepare("UPDATE conversations SET status='open', updated_at=? WHERE id=?").bind(now(), convId).run();
+        return json({ ok: true, status: 'open' });
+      }
+
+      // ---------- 新功能4：视频/语音链接卡片 ----------
+      if (path.match(/^\/api\/conversations\/\d+\/link$/) && method === 'POST') {
+        if (!(await requireAgent(request, env))) return json({ error: '未登录' }, 401);
+        const convId = Number(path.match(/\d+/)[0]);
+        const body = await readBody(request);
+        const urlStr = String(body.url || '');
+        if (!/^https?:\/\//i.test(urlStr)) return json({ error: '链接必须以 http:// 或 https:// 开头' }, 400);
+        if (urlStr.length > 500) return json({ error: '链接过长' }, 400);
+        const title = String(body.title || '会议链接').slice(0, 60);
+        const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id=?').bind(convId).first();
+        if (!conv) return json({ error: '会话不存在' }, 404);
+        const s = await getSettings(env);
+        const mid = await insertMessage(env, convId, {
+          sender: 'agent', sender_name: s.agent_name, type: 'link',
+          body: JSON.stringify({ title, url: urlStr }), status: 'read',
+        });
+        await touchConv(env, conv, `[视频/语音]${title}`);
+        return json({ ok: true, id: mid });
+      }
+
+      // ---------- AI 测试回复 ----------
+      if (path === '/api/ai/test' && method === 'POST') {
+        if (!(await requireAgent(request, env))) return json({ error: '未登录' }, 401);
+        const body = await readBody(request);
+        const s = await getSettings(env);
+        const merged = { ...s, ...body };
+        if (!merged.ai_api_key) return json({ ok: false, error: '请先填写 AI API Key' }, 400);
+        const reply = await callAI(env, merged, [], String(body.message || '你好'));
+        if (!reply) return json({ ok: false, error: 'AI 请求失败或超时（8秒），请检查 API 地址/Key/模型名' }, 502);
+        return json({ ok: true, reply });
+      }
+
+      // ---------- 登录 / 登出 / 我 ----------
+      if (path === '/api/login' && method === 'POST') {
+        const body = await readBody(request);
+        const password = String(body.password || '');
+        if (!password) return json({ error: '请输入口令' }, 400);
+        const s = await getSettings(env);
+        const agentCount = (await env.DB.prepare('SELECT COUNT(*) AS n FROM agents').first()).n;
+        if (!s.admin_token && agentCount === 0) {
+          // 首次登录：把本次口令设为系统口令
+          const h = await sha256(password);
+          await env.DB.prepare('UPDATE settings SET value=? WHERE key=?').bind(h, 'admin_token').run();
+          await env.DB.prepare('INSERT OR IGNORE INTO agents (token, name, created_at) VALUES (?,?,?)')
+            .bind(h, body.name || '管理员', now()).run();
+          return json({ ok: true, token: password, firstLogin: true, name: body.name || '管理员' });
+        }
+        const h = await sha256(password);
+        if (s.admin_token && h === s.admin_token) {
+          const name = (await env.DB.prepare('SELECT name FROM agents WHERE token=? LIMIT 1').bind(h).first())?.name || '管理员';
+          return json({ ok: true, token: password, name });
+        }
+        const row = await env.DB.prepare('SELECT name FROM agents WHERE token=?').bind(h).first();
+        if (row) return json({ ok: true, token: password, name: row.name });
+        return json({ error: '口令错误' }, 401);
+      }
+
+      if (path === '/api/logout' && method === 'POST') {
+        return json({ ok: true });
+      }
+
+      if (path === '/api/me' && method === 'GET') {
+        const t = await agentTokenFromReq(request, env);
+        if (!t) return json({ error: '未登录' }, 401);
+        const h = await sha256(t);
+        const row = await env.DB.prepare('SELECT name FROM agents WHERE token=? LIMIT 1').bind(h).first();
+        return json({ ok: true, name: row?.name || '管理员' });
+      }
+
+      // ---------- 设置 ----------
+      if (path === '/api/settings' && method === 'GET') {
+        if (!(await requireAgent(request, env))) return json({ error: '未登录' }, 401);
+        return json({ ok: true, settings: await getSettings(env) });
+      }
+
+      if (path === '/api/settings' && method === 'POST') {
+        if (!(await requireAgent(request, env))) return json({ error: '未登录' }, 401);
+        const body = await readBody(request);
+        const s = await getSettings(env);
+        const allowed = Object.keys(DEFAULT_SETTINGS);
+        for (const [k, v] of Object.entries(body)) {
+          if (!allowed.includes(k)) continue;
+          let val = v == null ? '' : String(v);
+          // 校验
+          if (k === 'ai_api_base' && val && !/^https?:\/\//i.test(val)) return json({ error: 'AI API 地址必须以 http:// 或 https:// 开头' }, 400);
+          if (k === 'ai_max_rounds') { const n = Number(val); val = (Number.isFinite(n) && n >= 1 && n <= 20) ? String(Math.floor(n)) : '6'; }
+          if (k === 'ai_api_key' && val.length > 200) return json({ error: 'API Key 过长' }, 400);
+          if (k === 'ai_prompt' && val.length > 2000) return json({ error: '系统提示词过长（2000字内）' }, 400);
+          if (k === 'end_message' && val.length > 200) return json({ error: '结束语文案过长（200字内）' }, 400);
+          await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
+            .bind(k, val).run();
+        }
+        return json({ ok: true, settings: await getSettings(env) });
+      }
+
+      // ---------- 统计 / 清理 ----------
+      if (path === '/api/stats' && method === 'GET') {
+        if (!(await requireAgent(request, env))) return json({ error: '未登录' }, 401);
+        const convs = (await env.DB.prepare('SELECT COUNT(*) AS n FROM conversations').first()).n;
+        const msgs = (await env.DB.prepare('SELECT COUNT(*) AS n FROM messages').first()).n;
+        const unread = (await env.DB.prepare(
+          "SELECT COUNT(*) AS n FROM messages m JOIN conversations c ON m.conv_id=c.id WHERE m.sender='visitor' AND m.deleted_agent=0 AND m.created_at > COALESCE(c.agent_last_read_at,'0000')"
+        ).first()).n;
+        return json({ ok: true, conversations: convs, messages: msgs, unread });
+      }
+
+      if (path === '/api/cleanup' && method === 'POST') {
+        if (!(await requireAgent(request, env))) return json({ error: '未登录' }, 401);
+        await env.DB.prepare("DELETE FROM messages WHERE status='recalled' AND created_at < datetime('now','-7 day')").run().catch(() => {});
+        return json({ ok: true });
+      }
+
+      // ---------- 文件 ----------
+      if (path === '/api/upload' && method === 'POST') {
+        const body = await readBody(request);
+        const data = String(body.data || '');
+        const size = Math.ceil(data.length * 3 / 4);
+        if (size > 700 * 1024) return json({ error: '图片过大（700KB内）' }, 400);
+        const r = await env.DB.prepare('INSERT INTO files (mime, size, data, created_at) VALUES (?,?,?,?)')
+          .bind(body.mime || 'image/png', size, data, now()).run();
+        return json({ ok: true, key: String(r.meta.last_row_id), size });
+      }
+
+      if (path.match(/^\/api\/file\/.+$/) && method === 'GET') {
+        const key = path.split('/').pop();
+        const row = await env.DB.prepare('SELECT * FROM files WHERE id=?').bind(Number(key)).first();
+        if (!row) return text('Not found', 404);
+        const b64 = row.data.replace(/^data:[^;]+;base64,/, '');
+        const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        return new Response(bin, { headers: { 'Content-Type': row.mime || 'image/png', 'Cache-Control': 'public, max-age=86400' } });
+      }
+
+      // 头像
+      if (path === '/api/avatar/agent' && method === 'GET') {
+        const s = await getSettings(env);
+        if (!s.agent_avatar_key) return text('No avatar', 404);
+        const row = await env.DB.prepare('SELECT * FROM files WHERE id=?').bind(Number(s.agent_avatar_key)).first();
+        if (!row) return text('No avatar', 404);
+        const b64 = row.data.replace(/^data:[^;]+;base64,/, '');
+        return new Response(Uint8Array.from(atob(b64), c => c.charCodeAt(0)), { headers: { 'Content-Type': row.mime || 'image/png' } });
+      }
+      if (path === '/api/avatar' && method === 'POST') {
+        const body = await readBody(request);
+        const r = await env.DB.prepare('INSERT INTO files (mime, size, data, created_at) VALUES (?,?,?,?)')
+          .bind(body.mime || 'image/png', Number(body.size || 0), String(body.data || ''), now()).run();
+        await env.DB.prepare('UPDATE settings SET value=? WHERE key=?').bind(String(r.meta.last_row_id), 'agent_avatar_key').run();
+        return json({ ok: true, key: String(r.meta.last_row_id) });
+      }
+      if (path === '/api/avatar/clear' && method === 'POST') {
+        if (!(await requireAgent(request, env))) return json({ error: '未登录' }, 401);
+        await env.DB.prepare("UPDATE settings SET value='' WHERE key='agent_avatar_key'").run();
+        return json({ ok: true });
+      }
+
+      // ---------- 已读 / 联系方式 / 导出 / 提示音 / 赞赏 ----------
+      if (path === '/api/read' && method === 'POST') {
+        const body = await readBody(request);
+        const convId = Number(body.conv);
+        const isAgent = await requireAgent(request, env);
+        const t = now();
+        if (isAgent) {
+          await env.DB.prepare('UPDATE conversations SET agent_last_read_at=?, agent_seen_at=? WHERE id=?').bind(t, t, convId).run();
+          await env.DB.prepare("UPDATE messages SET read_at=? WHERE conv_id=? AND sender='visitor' AND read_at IS NULL").bind(t, convId).run();
+        } else {
+          await env.DB.prepare('UPDATE conversations SET visitor_last_read_at=?, visitor_seen_at=? WHERE id=?').bind(t, t, convId).run();
+          await env.DB.prepare("UPDATE messages SET read_at=? WHERE conv_id=? AND sender='agent' AND read_at IS NULL").bind(t, convId).run();
+        }
+        return json({ ok: true });
+      }
+
+      if (path === '/api/contact' && method === 'POST') {
+        const body = await readBody(request);
+        const convId = Number(body.conv);
+        const contact = String(body.contact || '').slice(0, 200);
+        await env.DB.prepare('UPDATE conversations SET contact=?, updated_at=? WHERE id=?').bind(contact, now(), convId).run();
+        return json({ ok: true });
+      }
+
+      if (path === '/api/export' && method === 'GET') {
+        if (!(await requireAgent(request, env))) return json({ error: '未登录' }, 401);
+        const convs = await env.DB.prepare('SELECT * FROM conversations ORDER BY id ASC').all();
+        let csv = '会话ID,访客,备注,IP,状态,拉黑,联系方式,创建时间,最后消息,预览\n';
+        for (const c of convs.results) {
+          csv += [c.id, c.visitor_name || '', c.remark || '', c.geo_ip || '', c.status || 'open',
+            c.blocked ? '是' : '否', c.contact || '', c.created_at || '', c.last_message_at || '',
+            (c.last_preview || '').replace(/[,\n]/g, ' ')].join(',') + '\n';
+        }
+        return new Response('﻿' + csv, { headers: { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename=conversations.csv' } });
+      }
+
+      if (path === '/api/sound' && method === 'POST') {
+        if (!(await requireAgent(request, env))) return json({ error: '未登录' }, 401);
+        const body = await readBody(request);
+        for (const k of ['sound_in', 'sound_out', 'sound_custom', 'sound_repeat']) {
+          if (body[k] !== undefined) {
+            await env.DB.prepare('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
+              .bind(k, String(body[k])).run();
+          }
+        }
+        return json({ ok: true });
+      }
+
+      if (path === '/api/reward' && method === 'POST') {
+        const body = await readBody(request);
+        const log = await env.DB.prepare("SELECT value FROM settings WHERE key='reward_log'").first();
+        let arr = [];
+        try { arr = JSON.parse(log?.value || '[]'); } catch { arr = []; }
+        arr.push({ channel: body.channel || 'wechat', at: now() });
+        await env.DB.prepare("INSERT INTO settings (key,value) VALUES ('reward_log',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+          .bind(JSON.stringify(arr.slice(-100))).run();
+        return json({ ok: true });
+      }
+
+      // embed.js
+      if (path === '/embed.js' && method === 'GET') {
+        const js = `(function(){var d=document,s=d.createElement('script');s.src=(location.origin||'')+'/?embed=1';d.body.appendChild(s);})();`;
+        return new Response(js, { headers: { 'Content-Type': 'application/javascript; charset=utf-8' } });
+      }
+
+      return json({ error: '接口不存在', path }, 404);
     } catch (e) {
-      console.warn('R2 get failed, try D1:', String(e && e.message));
+      return json({ error: '服务器错误', detail: String(e && e.message || e) }, 500);
     }
-  }
-  const row = await env.DB.prepare('SELECT mime, data FROM files WHERE id = ?').bind(key).first();
-  if (!row || !row.data) return new Response('Not Found', { status: 404 });
-  return new Response(base64ToBytes(row.data), {
-    headers: { ...commonHeaders, 'content-type': row.mime || 'image/jpeg' },
-  });
-}
-
-async function handleUpload(request, env, url, ctx) {
-  const ident = await identify(request, env);
-  if (!ident) return fail('未登录', 401, 'unauthorized');
-
-  const convId = await resolveConvId(request, ident, url, null);
-  if (!convId) return fail('缺少会话标识', 400, 'missing_conv');
-  if (ident.role === 'visitor' && convId !== ident.convId) return fail('无权访问该会话', 403, 'forbidden');
-
-  let form;
-  try {
-    form = await request.formData();
-  } catch {
-    return fail('上传数据解析失败，请重试', 400, 'bad_form');
-  }
-  const file = form.get('file');
-  if (!file || typeof file === 'string') return fail('未收到文件', 400, 'no_file');
-
-  const maxMb = Number(env.MAX_IMAGE_MB || 5);
-  if (file.size > maxMb * 1024 * 1024) return fail(`图片过大，请压缩到 ${maxMb}MB 以内`, 413, 'too_large');
-
-  const mime = file.type || 'image/jpeg';
-  const ext = IMAGE_TYPES[mime];
-  if (!ext) return fail('只支持 JPG / PNG / GIF / WebP 图片', 415, 'unsupported_type');
-
-  const key = `${convId}/${uid(28)}.${ext}`;
-  const buffer = await file.arrayBuffer();
-  const storage = await storeImageBuffer(env, key, mime, buffer);
-  if (storage === 'too_large') {
-    return fail('图片仍然偏大，请换一张小一点的图或开启 R2 存储', 413, 'too_large_for_d1');
-  }
-  return json({ key, size: file.size, type: mime, storage });
-}
-
-async function handleFile(env, encodedKey) {
-  let key = '';
-  try {
-    key = decodeURIComponent(encodedKey);
-  } catch {
-    return new Response('Not Found', { status: 404 });
-  }
-  if (!key || !/^[a-zA-Z0-9-]+\/[a-f0-9]+\.(jpg|png|gif|webp|avif|mp3|m4a|ogg|wav|aac)$/.test(key)) {
-    return new Response('Not Found', { status: 404 });
-  }
-  return serveStoredFile(env, key);
-}
-
-async function handleAvatar(request, env) {
-  const ident = await identify(request, env);
-  if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
-
-  let form;
-  try {
-    form = await request.formData();
-  } catch {
-    return fail('上传数据解析失败，请重试', 400, 'bad_form');
-  }
-  const file = form.get('file');
-  if (!file || typeof file === 'string') return fail('未收到图片', 400, 'no_file');
-
-  const maxMb = Number(env.MAX_IMAGE_MB || 5);
-  if (file.size > maxMb * 1024 * 1024) return fail(`图片过大，请压缩到 ${maxMb}MB 以内`, 413, 'too_large');
-  const mime = file.type || 'image/jpeg';
-  const ext = IMAGE_TYPES[mime];
-  if (!ext) return fail('只支持 JPG / PNG / GIF / WebP 图片', 415, 'unsupported_type');
-
-  const buffer = await file.arrayBuffer();
-  const key = `avatar/${uid(28)}.${ext}`;
-  const storage = await storeImageBuffer(env, key, mime, buffer);
-  if (storage === 'too_large') return fail('图片仍然偏大，请换一张小一点的图或开启 R2 存储', 413, 'too_large_for_d1');
-
-  const s = await getSettings(env);
-  await removeStoredFile(env, s.agent_avatar_key);
-  await setSettings(env, { agent_avatar_key: key });
-  return json({ ok: true, avatarUrl: '/api/file/' + key });
-}
-
-async function handleAvatarClear(request, env) {
-  const ident = await identify(request, env);
-  if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
-  const s = await getSettings(env);
-  await removeStoredFile(env, s.agent_avatar_key);
-  await setSettings(env, { agent_avatar_key: '' });
-  return json({ ok: true, avatarUrl: '' });
-}
-
-async function handleSoundUpload(request, env) {
-  const ident = await identify(request, env);
-  if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
-
-  let form;
-  try {
-    form = await request.formData();
-  } catch {
-    return fail('上传数据解析失败，请重试', 400, 'bad_form');
-  }
-  const file = form.get('file');
-  if (!file || typeof file === 'string') return fail('未收到音频文件', 400, 'no_file');
-  if (file.size > 400 * 1024) return fail('提示音文件请小于 400KB（建议截取 2～5 秒）', 413, 'too_large');
-
-  const mime = (file.type || '').toLowerCase();
-  const ext = AUDIO_TYPES[mime];
-  if (!ext) return fail('只支持 MP3 / M4A / OGG / WAV / AAC 音频', 415, 'unsupported_type');
-
-  const buffer = await file.arrayBuffer();
-  const key = `sound/${uid(28)}.${ext}`;
-  const storage = await storeImageBuffer(env, key, mime, buffer);
-  if (storage === 'too_large') return fail('文件偏大，请换小一点的音频', 413, 'too_large_for_d1');
-
-  const s = await getSettings(env);
-  await removeStoredFile(env, s.sound_key);
-  await setSettings(env, { sound_key: key, sound_enabled: '1' });
-  return json({ ok: true, soundUrl: '/api/file/' + key });
-}
-
-async function handleAgentAvatar(env) {
-  const s = await getSettings(env);
-  const key = s.agent_avatar_key;
-  if (!key) return new Response('Not Found', { status: 404 });
-  return serveStoredFile(env, key);
-}
+  },
+};
