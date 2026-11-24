@@ -1,441 +1,725 @@
-// chat.js v3.4 访客端 + 客服端共用
-const $ = (sel, root = document) => root.querySelector(sel);
-const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+/**
+ * 聊天核心：消息渲染 + 输入框 + 表情面板 + 图片 + 轮询同步 + 撤回/删除/已读
+ * 访客端与客服端共用，靠 role 区分视角。
+ */
 
-async function api(path, opts = {}) {
-  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
-  const token = localStorage.getItem('agent_token') || localStorage.getItem('visitor_token');
-  if (token) headers['Authorization'] = 'Bearer ' + token;
-  const res = await fetch(path, {
-    method: opts.method || 'GET',
-    headers,
-    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok && !opts.allowError) throw new Error(data.error || ('HTTP ' + res.status));
-  return data;
-}
-
-function fmtTime(iso) {
-  if (!iso) return '';
-  const d = new Date(iso);
-  return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
-}
-
-function toast(msg) {
-  let t = $('.toast');
-  if (!t) { t = document.createElement('div'); t.className = 'toast'; document.body.appendChild(t); }
-  t.textContent = msg; t.classList.add('show');
-  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 2200);
-}
-
-function escapeHtml(s) {
-  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-
-// ============== 访客端 ==============
-const Visitor = {
-  conv: null, settings: null, lastId: 0, since: '0', timer: null, closed: false,
-
-  async init() {
-    const token = localStorage.getItem('visitor_token') || '';
-    const r = await api('/api/session', { method: 'POST', body: { token, referer: location.href, device: navigator.userAgent.slice(0, 80) } });
-    localStorage.setItem('visitor_token', r.token);
-    this.conv = r.conv; this.settings = r.settings;
-    if (this.settings.shop_name) $('.v-title').textContent = this.settings.shop_name;
-    await this.poll(true);
-    this.timer = setInterval(() => this.poll(false), 3000);
-    $('#send-btn').addEventListener('click', () => this.send());
-    $('#msg-input').addEventListener('keydown', e => { if (e.key === 'Enter') this.send(); });
-  },
-
-  async poll(initial) {
-    if (!this.conv) return;
-    try {
-      const r = await api(`/api/messages?conv=${this.conv.id}&after=${this.lastId}&since=${encodeURIComponent(this.since)}`, { allowError: true });
-      if (r.messages) {
-        for (const m of r.messages) this.appendMsg(m);
-        if (r.messages.length) this.lastId = Math.max(this.lastId, ...r.messages.map(x => x.id));
-      }
-      if (r.updates) this.applyUpdates(r.updates);
-      if (r.conv) this.applyConvState(r.conv);
-      if (r.settings) this.settings = r.settings;
-      if (!initial) api('/api/read', { method: 'POST', body: { conv: this.conv.id } }).catch(() => {});
-      this.scrollBottom();
-    } catch (e) { /* 静默 */ }
-  },
-
-  applyConvState(conv) {
-    this.closed = conv.status === 'closed';
-    const banner = $('#closed-banner');
-    const input = $('#msg-input'), btn = $('#send-btn');
-    if (this.closed) {
-      banner.textContent = (this.settings && this.settings.end_message) || '本次咨询已结束。';
-      banner.classList.add('show');
-      input.disabled = true; btn.disabled = true;
-    } else {
-      banner.classList.remove('show');
-      input.disabled = false; btn.disabled = false;
-    }
-  },
-
-  applyUpdates(updates) {
-    for (const u of updates) {
-      const el = document.querySelector(`[data-mid="${u.id}"]`);
-      if (!el) continue;
-      if (u.status === 'recalled') { el.querySelector('.bubble').innerHTML = '<i>消息已撤回</i>'; }
-      if (u.deleted_visitor) el.remove();
-    }
-  },
-
-  appendMsg(m) {
-    if (m.deleted_visitor) return;
-    const list = $('#messages');
-    let el = document.querySelector(`[data-mid="${m.id}"]`);
-    if (el) return;
-    el = document.createElement('div');
-    el.dataset.mid = m.id;
-    el.className = 'msg ' + (m.sender === 'visitor' ? 'mine' : 'other');
-    const avatar = m.sender === 'visitor' ? '我' : (this.settings?.agent_name || '客');
-    let bodyHtml = '';
-    if (m.type === 'link') {
-      try {
-        const lk = JSON.parse(m.body);
-        bodyHtml = `<a class="link-card" href="${escapeHtml(lk.url)}" target="_blank" rel="noopener">
-          <div class="lc-icon">📹</div><div><div class="lc-title">${escapeHtml(lk.title)}</div><div class="lc-url">${escapeHtml(lk.url)}</div></div></a>`;
-      } catch { bodyHtml = escapeHtml(m.body); }
-    } else if (m.file_key) {
-      bodyHtml = `<img src="/api/file/${m.file_key}" alt="图片">`;
-    } else if (m.status === 'recalled') {
-      bodyHtml = '<i>消息已撤回</i>';
-    } else {
-      bodyHtml = escapeHtml(m.body);
-    }
-    let tags = '';
-    if (m.ai_reply) tags = '<span class="tag ai">AI</span> ';
-    else if (m.auto_reply) tags = '<span class="tag auto">自动回复</span> ';
-    el.innerHTML = `<div class="avatar-sm">${escapeHtml(avatar)}</div><div class="msg-main">
-      <div class="bubble">${bodyHtml}</div>
-      <div class="meta">${tags}${fmtTime(m.created_at)}</div></div>`;
-    list.appendChild(el);
-    this.scrollBottom();
-  },
-
-  scrollBottom() {
-    const list = $('#messages');
-    list.scrollTop = list.scrollHeight;
-  },
-
-  async send() {
-    const input = $('#msg-input');
-    const text = input.value.trim();
-    if (!text || this.closed) return;
-    input.value = '';
-    try {
-      const r = await api('/api/messages', { method: 'POST', body: { conv: this.conv.id, body: text } });
-      if (r.closed) { toast(r.end_message || '对话已结束'); this.applyConvState({ status: 'closed' }); return; }
-      if (r.ok) this.poll(false);
-    } catch (e) { toast(e.message); }
-  },
+const ICONS = {
+  more: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>',
+  check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12.5l5 5L16 8"/><path d="M11 12.5l3 3"/></svg>',
+  image: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><circle cx="8.5" cy="9.5" r="1.6"/><path d="M4 17l4.6-4.4a2 2 0 012.7 0L16 17"/><path d="M15 14l1.6-1.5a2 2 0 012.7 0L21 14"/></svg>',
+  emoji: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="8.8" cy="10" r="1.1" fill="currentColor" stroke="none"/><circle cx="15.2" cy="10" r="1.1" fill="currentColor" stroke="none"/><path d="M8.2 14.4c.9 1.7 2.3 2.5 3.8 2.5s2.9-.8 3.8-2.5"/></svg>',
+  send: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4.2 11.6l15-6.8a.7.7 0 01.95.95l-6.8 15a.7.7 0 01-1.3 0l-2.4-5.7-5.7-2.4a.7.7 0 010-1.3z"/></svg>',
+  empty: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 01-9 8.4 9 9 0 01-3.8-.9L3 20l1.1-3.3A8.4 8.4 0 0112 3.1a8.4 8.4 0 019 8.4z"/></svg>',
 };
 
-// ============== 客服端 ==============
-const Agent = {
-  convs: [], current: null, lastVisitorAt: 0, timer: null, settings: {},
+/* 表情面板：常用一组，点一下插到光标处 */
+const EMOJI_LIST = [
+  '😀','😃','😄','😁','😆','😅','😂','🤣','😊','🙂','😉','😍','🥰','😘','😋','😎',
+  '🤩','🥳','😏','😢','😭','😤','😡','🤔','🤗','🤭','😴','😷','🤒','🥺','😳','😱',
+  '👍','👎','👏','🙏','🤝','💪','👌','✌️','🤞','👋','🙋','🫡','👀','💯','🔥','✨',
+  '❤️','💔','💗','💖','🌹','🎉','🎁','🌟','⭐','🌈','☀️','🌙','☕','🍰','🍜','🍎',
+];
 
-  async login(password, name) {
-    const r = await api('/api/login', { method: 'POST', body: { password, name } });
-    localStorage.setItem('agent_token', r.token);
-    $('#login-screen').style.display = 'none';
-    $('#app').style.display = 'flex';
-    await this.loadSettings();
-    await this.loadConvs();
-    this.timer = setInterval(() => this.loadConvs(true), 5000);
-  },
+const pad2 = (n) => String(n).padStart(2, '0');
 
-  async loadSettings() {
-    const r = await api('/api/settings');
-    this.settings = r.settings;
-  },
+// 前台可见时 2 秒同步一次；切到后台降频到 8 秒（不停摆，回来立刻补拉）
+const POLL_VISIBLE = 2000;
+const POLL_HIDDEN = 8000;
 
-  async loadConvs(poll = false) {
-    const r = await api('/api/conversations', { allowError: true });
-    if (!r.conversations) return;
-    this.convs = r.conversations;
-    this.renderList();
-    if (poll && this.current) {
-      const fresh = this.convs.find(c => c.id === this.current.id);
-      if (fresh) {
-        const last = fresh.last_message_at || '';
-        if (last > this.lastVisitorAt && fresh.unread > 0 && fresh.status === 'open' && !fresh.blocked) {
-          this.playRing();
-        }
-      }
-    }
-  },
+function dayKey(ts) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+}
 
-  playRing() {
-    try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const o = ctx.createOscillator(), g = ctx.createGain();
-      o.connect(g); g.connect(ctx.destination);
-      o.frequency.value = 880; g.gain.value = 0.08;
-      o.start(); setTimeout(() => { o.stop(); ctx.close(); }, 300);
-    } catch {}
-  },
+function dayLabel(ts) {
+  const d = new Date(ts);
+  const today = new Date();
+  const diff = Math.round(
+    (new Date(today.getFullYear(), today.getMonth(), today.getDate()) -
+      new Date(d.getFullYear(), d.getMonth(), d.getDate())) / 86400000
+  );
+  if (diff === 0) return '今天';
+  if (diff === 1) return '昨天';
+  if (diff > 1 && diff < 7) return `${diff} 天前`;
+  return `${d.getMonth() + 1} 月 ${d.getDate()} 日`;
+}
 
-  renderList() {
-    const list = $('#conv-list');
-    list.innerHTML = '';
-    // 合并客户组折叠：同一 customer_id 只显示主会话
-    const shown = new Set();
-    for (const c of this.convs) {
-      if (c.customer_id) {
-        if (c.id !== c.primaryId) continue;
-        if (shown.has(c.customer_id)) continue;
-        shown.add(c.customer_id);
-      }
-      list.appendChild(this.convItem(c));
-    }
-  },
-
-  convItem(c) {
-    const el = document.createElement('div');
-    el.className = 'conv-item' + (this.current && this.current.id === c.id ? ' active' : '');
-    const badges = [];
-    if (c.groupCount >= 2) badges.push(`<span class="badge ip" data-ip-badge>同IP×${c.groupCount}</span>`);
-    if (c.customer_id) badges.push(`<span class="badge cust">客户组×${c.memberCount || 1}</span>`);
-    if (c.status === 'closed') badges.push('<span class="badge closed">已结束</span>');
-    if (c.blocked) badges.push('<span class="badge blocked">已拉黑</span>');
-    const actions = [];
-    if (c.groupCount >= 2 && !c.customer_id) actions.push(`<button data-act="merge">合并为同一客户</button>`);
-    if (c.customer_id) actions.push(`<button data-act="split">拆分取消合并</button>`);
-    actions.push(`<button data-act="remark">备注</button>`);
-    actions.push(`<button data-act="block" class="danger">${c.blocked ? '解除拉黑' : '拉黑'}</button>`);
-    actions.push(`<button data-act="del" class="danger">删除会话</button>`);
-    el.innerHTML = `
-      <div class="c-row1"><span class="c-name">${escapeHtml(c.remark || c.visitor_name || ('访客#' + c.id))}</span>
-        ${c.unread ? `<span class="unread-dot">${c.unread}</span>` : ''}</div>
-      <div class="c-preview">${escapeHtml(c.last_preview || '（暂无消息）')}</div>
-      <div class="c-meta">${badges.join(' ')}<span>${c.geo_ip ? 'IP:' + escapeHtml(c.geo_ip) : '无IP'}</span><span>${fmtTime(c.last_message_at)}</span></div>
-      <div class="c-actions">${actions.join('')}</div>`;
-    el.addEventListener('click', e => {
-      const act = e.target.dataset && e.target.dataset.act;
-      if (act) { e.stopPropagation(); this.itemAction(act, c); return; }
-      this.selectConv(c);
-    });
-    return el;
-  },
-
-  async itemAction(act, c) {
-    try {
-      if (act === 'merge') {
-        if (!confirm('将同IP的多个会话合并为同一客户？（不删消息、不删会话）')) return;
-        await api(`/api/conversations/${c.id}/merge`, { method: 'POST' });
-        toast('已合并为同一客户'); this.loadConvs();
-      } else if (act === 'split') {
-        if (!confirm('取消合并，拆分为独立会话？')) return;
-        await api(`/api/conversations/${c.id}/split`, { method: 'POST' });
-        toast('已拆分'); this.loadConvs();
-      } else if (act === 'remark') {
-        const remark = prompt('填写客户备注：', c.remark || '');
-        if (remark === null) return;
-        await api(`/api/conversations/${c.id}/remark`, { method: 'POST', body: { remark } });
-        this.loadConvs();
-      } else if (act === 'block') {
-        await api(`/api/conversations/${c.id}/block`, { method: 'POST', body: { blocked: !c.blocked } });
-        this.loadConvs();
-      } else if (act === 'del') {
-        if (!confirm('确定删除该会话及其全部消息？')) return;
-        await api(`/api/conversations/${c.id}`, { method: 'DELETE' });
-        if (this.current && this.current.id === c.id) { this.current = null; $('#messages').innerHTML = ''; }
-        this.loadConvs();
-      }
-    } catch (e) { toast(e.message); }
-  },
-
-  async selectConv(c) {
-    this.current = c;
-    this.lastVisitorAt = c.last_message_at || '';
-    $$('.conv-item').forEach(x => x.classList.remove('active'));
-    this.renderList();
-    $('#chat-title').textContent = c.remark || c.visitor_name || ('访客#' + c.id);
-    await this.loadMessages();
-    this.renderTopbar();
-    api('/api/read', { method: 'POST', body: { conv: c.id } }).catch(() => {});
-  },
-
-  renderTopbar() {
-    const c = this.current;
-    const box = $('#topbar-btns');
-    if (!c) { box.innerHTML = ''; return; }
-    const closed = c.status === 'closed';
-    box.innerHTML = `
-      <button class="tbtn ${closed ? 'primary' : 'warn'}" data-top="close">${closed ? '重新打开' : '结束对话'}</button>
-      <button class="tbtn" data-top="link">📹 视频/语音</button>
-      <button class="tbtn" data-top="block">${c.blocked ? '解除拉黑' : '拉黑'}</button>
-      <button class="tbtn danger" data-top="del">删除会话</button>
-      <button class="tbtn" data-top="export">导出CSV</button>
-      <button class="tbtn" data-top="settings">⚙ 设置</button>`;
-    box.querySelectorAll('button').forEach(b => b.addEventListener('click', () => this.topAction(b.dataset.top)));
-  },
-
-  async topAction(act) {
-    const c = this.current; if (!c) return;
-    try {
-      if (act === 'close') {
-        if (c.status === 'closed') {
-          await api(`/api/conversations/${c.id}/reopen`, { method: 'POST' });
-          toast('已重新打开对话');
-        } else {
-          if (!confirm('结束对话？结束后访客将看到结束提示，不再响铃/推送/触发AI。')) return;
-          await api(`/api/conversations/${c.id}/close`, { method: 'POST' });
-          toast('对话已结束');
-        }
-        await this.loadConvs(); this.selectConv({ ...c, status: c.status === 'closed' ? 'open' : 'closed' });
-      } else if (act === 'link') {
-        this.openLinkPanel();
-      } else if (act === 'block') {
-        await api(`/api/conversations/${c.id}/block`, { method: 'POST', body: { blocked: !c.blocked } });
-        this.loadConvs(); this.selectConv(c);
-      } else if (act === 'del') {
-        if (!confirm('确定删除该会话及其全部消息？')) return;
-        await api(`/api/conversations/${c.id}`, { method: 'DELETE' });
-        this.current = null; $('#messages').innerHTML = ''; $('#chat-title').textContent = '选择会话';
-        this.loadConvs();
-      } else if (act === 'export') {
-        location.href = '/api/export';
-      } else if (act === 'settings') {
-        this.openSettings();
-      }
-    } catch (e) { toast(e.message); }
-  },
-
-  async loadMessages() {
-    const r = await api(`/api/messages?conv=${this.current.id}`);
-    const list = $('#messages');
-    list.innerHTML = '';
-    for (const m of r.messages || []) this.appendAgentMsg(m);
-    list.scrollTop = list.scrollHeight;
-  },
-
-  appendAgentMsg(m) {
-    if (m.deleted_agent) return;
-    const list = $('#messages');
-    let el = document.querySelector(`[data-mid="${m.id}"]`);
-    if (el) return;
-    el = document.createElement('div');
-    el.dataset.mid = m.id;
-    el.className = 'msg ' + (m.sender === 'agent' ? 'mine' : 'other');
-    let bodyHtml = '';
-    if (m.type === 'link') {
-      try {
-        const lk = JSON.parse(m.body);
-        bodyHtml = `<a class="link-card" href="${escapeHtml(lk.url)}" target="_blank" rel="noopener">
-          <div class="lc-icon">📹</div><div><div class="lc-title">${escapeHtml(lk.title)}</div><div class="lc-url">${escapeHtml(lk.url)}</div></div></a>`;
-      } catch { bodyHtml = escapeHtml(m.body); }
-    } else if (m.file_key) {
-      bodyHtml = `<img src="/api/file/${m.file_key}">`;
-    } else {
-      bodyHtml = escapeHtml(m.body);
-    }
-    let tags = '';
-    if (m.ai_reply) tags = '<span class="tag ai">AI回复</span> ';
-    else if (m.auto_reply) tags = '<span class="tag auto">自动回复</span> ';
-    el.innerHTML = `<div class="avatar-sm">${m.sender === 'agent' ? '客' : '访'}</div><div class="msg-main">
-      <div class="bubble">${bodyHtml}</div><div class="meta">${tags}${fmtTime(m.created_at)}</div></div>`;
-    list.appendChild(el);
-  },
-
-  async sendReply() {
-    const input = $('#a-input');
-    const text = input.value.trim();
-    if (!text || !this.current) return;
-    input.value = '';
-    await api('/api/messages', { method: 'POST', body: { conv: this.current.id, body: text } });
-    this.loadMessages(); this.loadConvs();
-  },
-
-  // ---------- 链接面板 ----------
-  openLinkPanel() {
-    $('#link-modal').classList.add('show');
-    $('#link-title').value = ''; $('#link-url').value = '';
-  },
-
-  async sendLink() {
-    const title = $('#link-title').value.trim();
-    const url = $('#link-url').value.trim();
-    try {
-      await api(`/api/conversations/${this.current.id}/link`, { method: 'POST', body: { title, url } });
-      $('#link-modal').classList.remove('show');
-      toast('链接卡片已发送');
-      this.loadMessages(); this.loadConvs();
-    } catch (e) { toast(e.message); }
-  },
-
-  // ---------- 设置弹窗 ----------
-  openSettings() {
-    const s = this.settings;
-    $('#set-shop').value = s.shop_name || '';
-    $('#set-agentname').value = s.agent_name || '';
-    $('#set-endmsg').value = s.end_message || '';
-    $('#set-reopenable').checked = s.reopenable === '1';
-    $('#ai-enabled').checked = s.ai_enabled === '1';
-    $('#ai-base').value = s.ai_api_base || '';
-    $('#ai-key').value = s.ai_api_key || '';
-    $('#ai-model').value = s.ai_model || '';
-    $('#ai-prompt').value = s.ai_prompt || '';
-    $('#ai-rounds').value = s.ai_max_rounds || '6';
-    $('#settings-modal').classList.add('show');
-  },
-
-  async saveSettings() {
-    const body = {
-      shop_name: $('#set-shop').value,
-      agent_name: $('#set-agentname').value,
-      end_message: $('#set-endmsg').value,
-      reopenable: $('#set-reopenable').checked ? '1' : '0',
-      ai_enabled: $('#ai-enabled').checked ? '1' : '0',
-      ai_api_base: $('#ai-base').value.trim(),
-      ai_api_key: $('#ai-key').value.trim(),
-      ai_model: $('#ai-model').value.trim(),
-      ai_prompt: $('#ai-prompt').value,
-      ai_max_rounds: $('#ai-rounds').value,
-    };
-    try {
-      await api('/api/settings', { method: 'POST', body });
-      await this.loadSettings();
-      toast('设置已保存');
-    } catch (e) { toast(e.message); }
-  },
-
-  async aiTest() {
-    const out = $('#ai-test-out');
-    out.classList.add('show'); out.textContent = '正在调用 AI…';
-    try {
-      const r = await api('/api/ai/test', { method: 'POST', body: { message: '你好' } });
-      out.textContent = r.ok ? 'AI回复：' + r.reply : ('失败：' + (r.error || ''));
-    } catch (e) { out.textContent = '失败：' + e.message; }
-  },
+const clockTime = (ts) => {
+  const d = new Date(ts);
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 };
 
-// ---------- 启动 ----------
-document.addEventListener('DOMContentLoaded', () => {
-  const role = document.body.dataset.role;
-  if (role === 'visitor') {
-    Visitor.init().catch(e => toast(e.message));
-  } else if (role === 'agent') {
-    $('#login-btn').addEventListener('click', () => {
-      Agent.login($('#login-password').value, $('#login-name').value).catch(e => toast(e.message));
-    });
-    $('#login-password').addEventListener('keydown', e => { if (e.key === 'Enter') $('#login-btn').click(); });
-    $('#a-send').addEventListener('click', () => Agent.sendReply());
-    $('#a-input').addEventListener('keydown', e => { if (e.key === 'Enter') Agent.sendReply(); });
-    $('#save-settings').addEventListener('click', () => Agent.saveSettings());
-    $('#ai-test-btn').addEventListener('click', () => Agent.aiTest());
-    $('#send-link-btn').addEventListener('click', () => Agent.sendLink());
-    $('#close-settings').addEventListener('click', () => $('#settings-modal').classList.remove('show'));
-    $('#close-link').addEventListener('click', () => $('#link-modal').classList.remove('show'));
-    $$('.modal-mask').forEach(m => m.addEventListener('click', e => { if (e.target === m) m.classList.remove('show'); }));
+const EMOJI_ONLY = /^[\p{Extended_Pictographic}\u200d\uFE0F\s]+$/u;
+
+/* 图片压缩：手机原图常 5MB，压到长边 1400、控制在 400KB 内 */
+async function shrinkImage(file, maxDim = 1400, targetBytes = 400 * 1024) {
+  if (!file.type.startsWith('image/') || file.type === 'image/gif') return file;
+
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch {
+    return file;
   }
-});
+  if (!bitmap.width || !bitmap.height) return file;
+
+  const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
+  if (scale === 1 && file.size <= targetBytes) return file;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+
+  let quality = 0.82;
+  let blob = null;
+  for (let i = 0; i < 5; i++) {
+    blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', quality));
+    if (!blob) break;
+    if (blob.size <= targetBytes) break;
+    quality -= 0.12;
+  }
+  if (blob && (blob.size < file.size || file.size > targetBytes)) {
+    blob.name = 'photo.jpg';
+    return blob;
+  }
+  return file;
+}
+
+export function toast(msg) {
+  let el = document.getElementById('toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toast';
+    el.className = 'toast';
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove('show'), 2400);
+}
+
+function openLightbox(src) {
+  let box = document.getElementById('lightbox');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'lightbox';
+    box.className = 'lightbox';
+    const img = document.createElement('img');
+    img.alt = '';
+    box.appendChild(img);
+    box.addEventListener('click', () => box.classList.remove('open'));
+    document.body.appendChild(box);
+  }
+  box.querySelector('img').src = src;
+  box.classList.add('open');
+}
+
+/**
+ * @param {object} opts
+ * @param {HTMLElement} opts.root
+ * @param {'visitor'|'agent'} opts.role
+ * @param {string} opts.token
+ * @param {string|null} [opts.convId]
+ * @param {number} [opts.recallWindow]
+ * @param {(conv)=>void} [opts.onMeta]
+ * @param {()=>void} [opts.onChange]
+ * @param {string} [opts.emptyText]
+ */
+export function createChatHost(opts) {
+  const {
+    root,
+    role,
+    token,
+    recallWindow = 120,
+    onMeta,
+    onChange,
+    emptyText =
+      role === 'agent' ? '选择左侧会话开始回复' : '有任何问题都可以在这里留言，我们会尽快回复',
+    selfName = '',
+    selfAvatarUrl = '',
+    peerAvatarUrl = '',
+    onIncoming = null,
+  } = opts;
+
+  let convId = opts.convId || null;
+  let messages = [];
+  let lastId = 0;
+  let since = 0;
+  let lastSig = '';
+  let timer = null;
+  let sending = false;
+  let stick = true;
+
+  /* ------------------------------- 骨架 ------------------------------- */
+  root.innerHTML = `
+    <div class="chat-scroll" role="log" aria-live="polite"><div class="chat-list"></div></div>
+    <div class="composer">
+      <div class="emoji-panel" hidden></div>
+      <div class="composer-inner">
+        <button class="icon-btn" type="button" data-act="pick" title="发送图片" aria-label="发送图片">${ICONS.image}</button>
+        <button class="icon-btn" type="button" data-act="emoji" title="表情" aria-label="表情">${ICONS.emoji}</button>
+        <div class="composer-field">
+          <textarea rows="1" placeholder="输入消息，Enter 发送" aria-label="消息输入框" maxlength="1000"></textarea>
+        </div>
+        <button class="send-btn" type="button" data-act="send" title="发送" aria-label="发送" disabled>${ICONS.send}</button>
+        <input type="file" accept="image/*" hidden>
+      </div>
+    </div>
+  `;
+
+  const scroll = root.querySelector('.chat-scroll');
+  const list = root.querySelector('.chat-list');
+  const composer = root.querySelector('.composer');
+  const emojiPanel = composer.querySelector('.emoji-panel');
+  const textarea = composer.querySelector('textarea');
+  const sendBtn = composer.querySelector('[data-act="send"]');
+  const pickBtn = composer.querySelector('[data-act="pick"]');
+  const emojiBtn = composer.querySelector('[data-act="emoji"]');
+  const fileInput = composer.querySelector('input[type="file"]');
+
+  /* ------------------------------- 请求 ------------------------------- */
+  function authHeaders(extra = {}) {
+    if (role === 'visitor') return { 'x-visitor-token': token, ...extra };
+    return { authorization: `Bearer ${token}`, ...extra };
+  }
+
+  async function api(path, { method = 'GET', body } = {}) {
+    const res = await fetch(path, {
+      method,
+      headers: authHeaders(body ? { 'content-type': 'application/json' } : {}),
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const err = new Error(data.message || `请求失败（${res.status}）`);
+      err.status = res.status;
+      throw err;
+    }
+    return data;
+  }
+
+  async function upload(file) {
+    const blob = await shrinkImage(file);
+    const fd = new FormData();
+    const ext = ((blob.type || 'image/jpeg').split('/')[1] || 'jpg').replace('jpeg', 'jpg');
+    fd.append('file', blob, `photo-${Date.now()}.${ext}`);
+    const res = await fetch(`/api/upload?conv=${encodeURIComponent(convId)}`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: fd,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.message || '图片上传失败');
+    return data;
+  }
+
+  /* ------------------------------- 渲染 ------------------------------- */
+  function emptyNode() {
+    const div = document.createElement('div');
+    div.className = 'chat-empty';
+    div.innerHTML = `${ICONS.empty}<p>${emptyText}</p>`;
+    return div;
+  }
+
+  function needDaySep(prevTs, ts) {
+    return !prevTs || dayKey(prevTs) !== dayKey(ts);
+  }
+
+  function messageNode(m) {
+    const mine = m.sender === role;
+
+    if (m.status === 'recalled') {
+      const line = document.createElement('div');
+      line.className = 'sys-line';
+      line.textContent = mine ? '你撤回了一条消息' : `${m.senderName || '对方'}撤回了一条消息`;
+      line.dataset.id = m.id;
+      return line;
+    }
+
+    const wrap = document.createElement('div');
+    wrap.className = `msg ${mine ? 'me' : 'other'}`;
+    wrap.dataset.id = m.id;
+
+    const myName = selfName || (role === 'agent' ? '客服' : '我');
+    const otherName = m.senderName || (role === 'agent' ? '访客' : '客服');
+    const displayName = mine ? myName : otherName;
+    const avatarUrl = mine ? selfAvatarUrl : peerAvatarUrl;
+
+    const av = document.createElement('div');
+    av.className = 'avatar-sm';
+    if (avatarUrl) {
+      const img = document.createElement('img');
+      img.className = 'avatar-img';
+      img.src = avatarUrl;
+      img.alt = displayName;
+      img.onerror = () => {
+        av.textContent = displayName.slice(0, 1);
+      };
+      av.appendChild(img);
+    } else {
+      av.textContent = displayName.slice(0, 1);
+    }
+
+    const main = document.createElement('div');
+    main.className = 'msg-main';
+
+    if (!mine && otherName) {
+      const name = document.createElement('div');
+      name.className = 'msg-name';
+      name.textContent = otherName;
+      main.appendChild(name);
+    }
+
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble' + (m.type === 'image' ? ' img-bubble' : '');
+    if (m.type === 'text' && m.body && EMOJI_ONLY.test(m.body) && m.body.length <= 8) {
+      bubble.classList.add('emoji-bubble');
+    }
+
+    if (m.type === 'image' && m.fileKey) {
+      const img = document.createElement('img');
+      img.src = `/api/file/${m.fileKey}`;
+      img.alt = '聊天图片';
+      img.loading = 'lazy';
+      img.addEventListener('click', () => openLightbox(img.src));
+      img.addEventListener('load', () => {
+        if (stick) toBottom();
+      });
+      bubble.appendChild(img);
+      if (m.body) {
+        const cap = document.createElement('div');
+        cap.className = 'img-cap';
+        cap.textContent = m.body;
+        bubble.appendChild(cap);
+      }
+    } else {
+      bubble.textContent = m.body || '';
+    }
+
+    main.appendChild(bubble);
+
+    if (m.autoReply) {
+      const tag = document.createElement('div');
+      tag.className = 'msg-tag';
+      tag.textContent = '自动回复';
+      main.appendChild(tag);
+    }
+
+    const meta = document.createElement('div');
+    meta.className = 'msg-meta';
+    const time = document.createElement('span');
+    time.textContent = clockTime(m.createdAt);
+    meta.appendChild(time);
+
+    if (mine) {
+      const state = document.createElement('span');
+      state.className = 'state-pill ' + (m.readAt ? 'read' : 'unread');
+      state.innerHTML = m.readAt ? `${ICONS.check}<span>已读</span>` : '<span>未读</span>';
+      meta.appendChild(state);
+    }
+    const actions = document.createElement('div');
+    actions.className = 'msg-actions';
+    const dots = document.createElement('button');
+    dots.type = 'button';
+    dots.className = 'btn-dots';
+    dots.setAttribute('aria-label', '消息操作');
+    dots.innerHTML = ICONS.more;
+    dots.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleMenu(main, m);
+    });
+    actions.appendChild(dots);
+
+    main.appendChild(meta);
+    meta.appendChild(actions);
+
+    wrap.appendChild(av);
+    wrap.appendChild(main);
+    return wrap;
+  }
+
+  function buildMenu(m) {
+    const menu = document.createElement('div');
+    menu.className = 'pop-menu';
+
+    const canRecall =
+      m.sender === role && m.status === 'active' && Date.now() - m.createdAt <= recallWindow * 1000;
+
+    if (canRecall) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = '撤回';
+      b.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        closeMenus();
+        if (!confirm('撤回后双方都看不到这条消息，确定撤回？')) return;
+        try {
+          await api(`/api/messages/${m.id}/recall`, { method: 'POST' });
+          patchLocal(m.id, { status: 'recalled', body: '', fileKey: '', updatedAt: Date.now() });
+          render(true);
+          toast('已撤回');
+        } catch (err) {
+          toast(err.message);
+        }
+      });
+      menu.appendChild(b);
+    }
+
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'danger';
+    del.textContent = '删除';
+    del.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      closeMenus();
+      try {
+        await api(`/api/messages/${m.id}/delete`, { method: 'POST' });
+        messages = messages.filter((x) => x.id !== m.id);
+        lastSig = '';
+        render(true);
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+    menu.appendChild(del);
+
+    return menu;
+  }
+
+  function toggleMenu(container, m) {
+    const existing = container.querySelector('.pop-menu');
+    closeMenus();
+    if (existing) return;
+    const menu = buildMenu(m);
+    container.appendChild(menu);
+
+    const menuRect = menu.getBoundingClientRect();
+    const visible = scroll.getBoundingClientRect();
+    if (menuRect.bottom > visible.bottom - 8) menu.classList.add('up');
+  }
+
+  function closeMenus() {
+    root.querySelectorAll('.pop-menu').forEach((n) => n.remove());
+  }
+
+  root.addEventListener('click', (e) => {
+    if (!e.target.closest('.msg-actions') && !e.target.closest('.pop-menu')) closeMenus();
+  });
+
+  function isNearBottom() {
+    return scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 90;
+  }
+
+  scroll.addEventListener('scroll', () => {
+    stick = isNearBottom();
+  });
+
+  function toBottom() {
+    scroll.scrollTop = scroll.scrollHeight;
+  }
+
+  function render(force = false) {
+    const sig =
+      messages.map((m) => `${m.id}:${m.updatedAt}:${m.readAt}:${m.status}`).join('|') + `#${convId}`;
+    if (!force && sig === lastSig) return;
+    lastSig = sig;
+
+    const wasStick = stick;
+    list.innerHTML = '';
+
+    if (!messages.length) {
+      list.appendChild(emptyNode());
+      return;
+    }
+
+    let prevTs = 0;
+    for (const m of messages) {
+      if (needDaySep(prevTs, m.createdAt)) {
+        const sep = document.createElement('div');
+        sep.className = 'day-sep';
+        sep.textContent = dayLabel(m.createdAt);
+        list.appendChild(sep);
+      }
+      prevTs = m.createdAt;
+      list.appendChild(messageNode(m));
+    }
+
+    if (wasStick || force) {
+      toBottom();
+      requestAnimationFrame(toBottom);
+    }
+  }
+
+  function patchLocal(id, patch) {
+    const idx = messages.findIndex((m) => m.id === id);
+    if (idx >= 0) messages[idx] = { ...messages[idx], ...patch };
+    lastSig = '';
+  }
+
+  function pushMessages(items) {
+    let changed = false;
+    for (const m of items) {
+      if (messages.some((x) => x.id === m.id)) continue;
+      messages.push(m);
+      changed = true;
+    }
+    if (changed) {
+      messages.sort((a, b) => a.id - b.id);
+      lastId = Math.max(lastId, ...messages.map((m) => m.id));
+      lastSig = '';
+    }
+    return changed;
+  }
+
+  function mergeMessages(items) {
+    let changed = false;
+    for (const m of items) {
+      const idx = messages.findIndex((x) => x.id === m.id);
+      if (idx >= 0) {
+        if (messages[idx].updatedAt !== m.updatedAt || messages[idx].readAt !== m.readAt) {
+          messages[idx] = m;
+          changed = true;
+        }
+      }
+    }
+    if (changed) lastSig = '';
+    return changed;
+  }
+
+  /* ------------------------------- 同步 ------------------------------- */
+  let pulling = false;
+
+  async function pull(initial = false) {
+    if (!convId || pulling) return;
+    pulling = true;
+    const snapshot = convId;
+    try {
+      const q = new URLSearchParams({ conv: convId });
+      if (!initial) {
+        q.set('after', String(lastId));
+        if (since > 0) q.set('since', String(since));
+      }
+      const data = await api(`/api/messages?${q.toString()}`);
+
+      // 期间切换了会话，这批结果直接丢弃
+      if (snapshot !== convId) return;
+
+      let changed = false;
+      if (data.messages && data.messages.length) {
+        changed = pushMessages(data.messages) || changed;
+        since = Math.max(since, ...data.messages.map((m) => m.updatedAt || 0));
+        const incoming = data.messages.filter((m) => m.sender === 'visitor');
+        if (incoming.length && onIncoming) onIncoming(incoming);
+      }
+      if (data.updates && data.updates.length) {
+        changed = mergeMessages(data.updates) || changed;
+        since = Math.max(since, ...data.updates.map((m) => m.updatedAt || 0));
+      }
+
+      if (changed) {
+        render();
+        if (onChange) onChange();
+      }
+      if (onMeta && data.conv) onMeta(data.conv);
+
+      if (data.conv && data.conv.unread > 0 && document.visibilityState === 'visible') {
+        await markRead();
+      }
+    } finally {
+      pulling = false;
+    }
+  }
+
+  async function markRead() {
+    if (!convId) return;
+    try {
+      await api('/api/read', { method: 'POST', body: { conv: convId } });
+    } catch {
+      /* 忽略 */
+    }
+  }
+
+  function schedule() {
+    stopPolling();
+    const delay = document.visibilityState === 'visible' ? POLL_VISIBLE : POLL_HIDDEN;
+    timer = setTimeout(async () => {
+      try {
+        await pull();
+      } catch {
+        /* 断网时下一轮自动重试 */
+      }
+      schedule();
+    }, delay);
+  }
+
+  function stopPolling() {
+    if (timer) clearTimeout(timer);
+    timer = null;
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (!convId) return;
+    if (document.visibilityState === 'visible') pull().catch(() => {});
+    schedule();
+  });
+
+  /* ------------------------------- 输入 ------------------------------- */
+  function resize() {
+    textarea.style.height = 'auto';
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 120)}px`;
+    sendBtn.disabled = !textarea.value.trim() || sending;
+  }
+
+  textarea.addEventListener('input', resize);
+  textarea.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      sendText();
+    }
+  });
+
+  sendBtn.addEventListener('click', sendText);
+
+  function buildEmojiPanel() {
+    const frag = document.createDocumentFragment();
+    for (const emoji of EMOJI_LIST) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'emoji-item';
+      b.textContent = emoji;
+      b.addEventListener('click', (e) => {
+        e.preventDefault();
+        insertAtCursor(emoji);
+      });
+      frag.appendChild(b);
+    }
+    emojiPanel.appendChild(frag);
+  }
+  buildEmojiPanel();
+
+  emojiBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    emojiPanel.hidden = !emojiPanel.hidden;
+    if (!emojiPanel.hidden) textarea.focus();
+  });
+
+  composer.addEventListener('click', (e) => {
+    if (!e.target.closest('.emoji-panel') && !e.target.closest('[data-act="emoji"]')) {
+      emojiPanel.hidden = true;
+    }
+  });
+
+  function insertAtCursor(text) {
+    const start = textarea.selectionStart ?? textarea.value.length;
+    const end = textarea.selectionEnd ?? textarea.value.length;
+    textarea.value = textarea.value.slice(0, start) + text + textarea.value.slice(end);
+    const pos = start + text.length;
+    try {
+      textarea.setSelectionRange(pos, pos);
+    } catch {}
+    textarea.focus();
+    resize();
+  }
+
+  async function sendText() {
+    const text = textarea.value.trim();
+    if (!text || sending || !convId) return;
+    sending = true;
+    sendBtn.disabled = true;
+    emojiPanel.hidden = true;
+    try {
+      const res = await api('/api/messages', {
+        method: 'POST',
+        body: { conv: convId, type: 'text', body: text },
+      });
+      textarea.value = '';
+      resize();
+      if (res.message) {
+        pushMessages([res.message]);
+        render(true);
+      } else {
+        await pull();
+      }
+    } catch (err) {
+      toast(err.message);
+    } finally {
+      sending = false;
+      resize();
+    }
+  }
+
+  pickBtn.addEventListener('click', () => fileInput.click());
+
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files && fileInput.files[0];
+    fileInput.value = '';
+    if (!file || !convId) return;
+    if (!file.type.startsWith('image/')) {
+      toast('请选择图片文件');
+      return;
+    }
+    pickBtn.disabled = true;
+    const oldTitle = pickBtn.title;
+    pickBtn.title = '上传中…';
+    try {
+      const up = await upload(file);
+      const res = await api('/api/messages', {
+        method: 'POST',
+        body: { conv: convId, type: 'image', fileKey: up.key, fileSize: up.size },
+      });
+      if (res.message) {
+        pushMessages([res.message]);
+        render(true);
+      } else {
+        await pull();
+      }
+    } catch (err) {
+      toast(err.message);
+    } finally {
+      pickBtn.disabled = false;
+      pickBtn.title = oldTitle;
+    }
+  });
+
+  /* ------------------------------- 对外 ------------------------------- */
+  function setConv(id) {
+    if (convId === id) return;
+    convId = id;
+    messages = [];
+    lastId = 0;
+    since = 0;
+    lastSig = '';
+    emojiPanel.hidden = true;
+    textarea.value = '';
+    resize();
+    render(true);
+    if (id) {
+      pull(true).catch((e) => toast(e.message));
+      schedule();
+    } else {
+      stopPolling();
+    }
+  }
+
+  function refresh() {
+    return pull(true);
+  }
+
+  function destroy() {
+    stopPolling();
+    closeMenus();
+  }
+
+  if (convId) {
+    render(true);
+    pull(true).catch(() => {});
+    schedule();
+  } else {
+    render(true);
+  }
+
+  return { setConv, refresh, destroy };
+}
