@@ -1,117 +1,104 @@
-# 在线客服聊天系统（Workers + D1）
+# 在线客服聊天系统（Cloudflare Workers + D1）
 
-访客端和客服工作台在同一个域名下，纯 Cloudflare 免费额度就能跑：**Workers（计算）+ D1（数据库）+ 静态资源**。图片默认也存 D1，配置 R2 后自动改用 R2。
+访客端和客服工作台在同一个域名下，纯 Cloudflare 免费额度即可运行：**Workers（计算）+ D1（数据库）+ 静态资源**。图片默认存 D1，配置 R2 后自动改用 R2，全程无需服务器、无需付费。
 
-![访客端](docs/preview-visitor.png)
-![客服工作台](docs/preview-agent.png)
-
-## 功能
+## 功能（v3.4）
 
 **访客端 `/`**
-- 打开网址直接对话，不需要注册登录（身份存在浏览器本地，刷新不丢记录）
-- 文字、表情（内置表情面板）、图片（自动压缩后上传）
-- 撤回（默认 120 秒内，仅发送方可撤回，双方都显示撤回提示）
-- 删除（只对自己隐藏，对方不受影响）
-- 自己发的消息显示 **已读 / 未读**
-- 图片点击可全屏查看
+- 打开网址直接对话，无需注册登录；身份存在浏览器本地，刷新不丢记录
+- 发文字、表情、图片（前端自动压缩后上传），支持撤回、单侧删除、已读 / 未读回执
+- 命中关键词自动收到回复（带「自动回复」标签），可留下联系方式（手机 / 微信 / QQ / 邮箱）
+- 收到「视频 / 语音」链接卡片，点击新标签打开；对话被客服结束后显示结束文案、输入框禁用
 
-**客服工作台 `/agent`**
-- 口令登录，可自定义客服名称（首次登录时输入的口令即成为系统口令）
-- 会话列表：按最新消息排序，显示最后一条预览、**未读角标**、对方**在线**小绿点
-- 备注顾客（只在自己工作台显示，不影响访客端）
-- 文字 / 表情 / 图片，同样支持撤回、删除、已读回执
-- 设置面板：店铺名称、客服名称、**客服头像（上传图片 / 清除）**、自动欢迎语（开关 + 内容 + 署名）、修改口令
-- 设置面板：**存储用量面板 + 自动清理天数 + 立即清理**
-- 设置面板：**接待状态（在线 / 离线）**、**新消息提示音**、**允许访客留联系方式**、**在线/离线两套关键词自动回复**、**微信推送（Server酱）**
-- 会话信息：**访客 IP / 归属地 / 来源网站 / 联系方式**（列表和会话顶部都显示）
-- **导出聊天记录**（单个会话导出 CSV，Excel 可直接打开）
-- 窄屏自动切换「会话列表 → 聊天」单栏布局
+**客服工作台 `/agent.html`**
+- 口令登录，可自定义客服名称；多客服可同时登录，消息按各自名称署名
+- 会话列表：按最新消息排序、未读角标、在线状态、访客 IP / 归属地 / 来源网站 / 设备识别
+- 收发回复、撤回、备注、拉黑（可撤销）、删除会话（二次确认）、导出单个会话 CSV
+- **同客户归并**：同一客户换浏览器、换设备再来（出口 IP 相同）自动标「同IP×N」，一键合并为同一客户组，随时可拆分，不删消息、不删会话
+- **AI 托管**：接入任意 OpenAI 兼容大模型（默认 DeepSeek）自动回复，8 秒超时静默回退人工；AI 回复带「AI」标签，不响铃、不推送，Key 只存在你自己的 D1，不下发访客
+- **结束对话 / 重新打开**：结束后访客端输入框变灰，客服不再响铃、不推送、不触发 AI；可配置结束后允许客户重新发起
+- **视频 / 语音链接面板**：发送腾讯会议、微信视频、电话、二维码等外部链接卡片
+- 在线 / 离线两套关键词自动回复；Server酱 / PushPlus / 钉钉 / 企微 / Bark 五渠道消息推送；三音提示音可重复、可上传自定义；客服头像上传；店铺名 / 欢迎语自定义
 
-**访客端补充**
-- 消息上方显示完整客服名称（不再只显示首字），头像支持图片
-- 命中关键词时自动收到回复（消息带「自动回复」标签）
-- 「留联系方式」按钮：手机号 / 微信 / QQ / 邮箱，可不填
+**网站嵌入**
+- `public/embed.js`：一行代码在你的网站右下角出现悬浮客服按钮，点击打开聊天窗口
 
-**嵌入到别的网站**
-- `public/embed.js`：一行配置出右下角悬浮客服按钮（也支持 iframe 直接嵌）
+## 预览
+
+![访客端](预览/visitor.png)
+![客服工作台](预览/agent-console.png)
+![AI 设置](预览/settings-ai.png)
+
+## 快速部署（Fork，全程浏览器操作，无需命令行）
+
+完整图文步骤见《[Cloudflare部署完整教程.md](Cloudflare部署完整教程.md)》，流程一句话：
+
+1. 右上角 **Fork** 本项目到你自己的 GitHub 账号；
+2. Cloudflare 控制台创建免费 D1 数据库 `cf_kefu`，复制 Database ID；
+3. 在自己 Fork 的仓库里打开 `wrangler.toml`，把 `REPLACE_WITH_YOUR_D1_DATABASE_ID` 替换成你的 ID 并提交；
+4. Cloudflare Workers Builds 连接你 Fork 的仓库并自动部署；
+5. 打开 `/agent.html`，首次登录输入的口令即成为系统口令，请牢记。
+
+> 数据表由 Worker 首次运行时自动创建、自动补列，不需要手工执行 SQL。
 
 ## 目录结构
 
 ```
 cf-kefu-chat/
-├── src/index.js                   # Worker：API + 静态资源路由 + 自动建表
+├── src/index.js                 # Worker：API + 路由 + 自动建表 / 补列
 ├── public/
-│   ├── index.html                 # 访客端
-│   ├── agent.html                 # 客服工作台（登录/设置/备注）
-│   ├── favicon.svg
+│   ├── index.html               # 访客端
+│   ├── agent.html                # 客服工作台（登录 / 列表 / 设置）
+│   ├── embed.js                 # 网站悬浮挂件
 │   └── assets/
-│       ├── app.css                # 两端共用样式
-│       └── chat.js                # 两端共用聊天核心（轮询/表情/图片/撤回/已读）
-├── migrations/                    # 建表 SQL（仅参考，运行时会自动建表）
-├── wrangler.toml                  # Cloudflare 配置
-├── .github/workflows/deploy.yml   # 可选：GitHub Actions 部署
-└── docs/                          # 预览截图
+│       ├── app.css               # 两端共用样式
+│       └── chat.js               # 两端共用聊天核心
+├── migrations/                  # 建表 SQL（仅参考，运行时自动建表）
+├── wrangler.toml                # Cloudflare 配置（只填 database_id）
+├── 预览/                         # 界面截图
+└── docs/reward/                 # 赞赏码
 ```
-
-## 部署（不需要任何命令行）
-
-1. **建 D1 数据库**：Cloudflare 控制台 → Storage & Databases → D1 SQL Database → Create database，名称 `cf_kefu`，创建后复制 `Database ID`。
-2. **传代码到 GitHub**：新建仓库，把本项目所有文件（保持目录结构）上传提交。
-3. **填 database_id**：在 GitHub 打开 `wrangler.toml`，把 `REPLACE_WITH_YOUR_D1_DATABASE_ID` 替换成第 1 步的 ID，提交。
-4. **连自动部署**：Cloudflare 控制台 → Workers & Pages → Create → Workers → Import a repository → 选这个仓库；构建命令 `npm install`，部署命令 `npx wrangler deploy` → 部署。
-5. 打开输出的 `https://cf-kefu-chat.xxx.workers.dev`（访客端），`/agent` 是客服端。**第一次登录时输入的口令会自动成为系统口令。**
-
-> 数据表由 Worker 首次请求时自动创建，不需要执行 `wrangler d1 migrations apply`。
-
-## 改配置
-
-`wrangler.toml` 的 `[vars]` 只是**初始默认值**，部署后都能在「工作台 → 设置」里改并立即生效：
-
-| 变量 | 说明 |
-| --- | --- |
-| `SHOP_NAME` | 访客端顶部店铺名（首次建库时写入 D1，之后以设置为准） |
-| `AGENT_NAME` | 欢迎语默认署名 |
-| `WELCOME_MESSAGE` | 默认欢迎语内容 |
-| `MAX_IMAGE_MB` | 单张图片上限（默认 5） |
-| `RECALL_WINDOW_SEC` | 撤回时限秒数（默认 120） |
-
-前端刷新频率：`public/assets/chat.js` 顶部 `POLL_VISIBLE = 2000`（页面可见时）、`POLL_HIDDEN = 8000`（切到后台时降频）。
-
-## 接口
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| POST | `/api/session` | 访客建会话（新会话自动发欢迎语） |
-| POST | `/api/login` | 客服登录（名称 + 口令） |
-| GET | `/api/me` | 当前客服信息 |
-| POST | `/api/agent/profile` | 改客服名称 |
-| GET/POST | `/api/settings` | 读取 / 保存店铺名、欢迎语、口令 |
-| GET | `/api/conversations` | 会话列表（未读、在线、备注） |
-| POST | `/api/conversations/:id/remark` | 备注顾客 |
-| GET | `/api/messages?conv=&after=&since=` | 拉消息：`after` 增量，`since` 状态变化 |
-| POST | `/api/messages` | 发消息（text / image） |
-| POST | `/api/messages/:id/recall` | 撤回 |
-| POST | `/api/messages/:id/delete` | 删除（单侧隐藏） |
-| POST | `/api/upload?conv=` | 上传图片 |
-| GET | `/api/file/:key` | 读图片 |
-| POST | `/api/read` | 标记已读 |
-
-鉴权：访客用请求头 `x-visitor-token`；客服 `Authorization: Bearer <登录返回的 token>`。
 
 ## 说明与限制
 
-- **实时性**：轮询方案，可见时 2 秒、后台时 8 秒。按 Workers 每天 10 万次请求额度，足够 2～3 个客服台常开 + 若干访客在线。需要真推送可后续换 Durable Objects + WebSocket。
-- **图片存储**：未配置 R2 时存 D1（单张 ≤ 700KB，前端会自动压到 400KB 内）；要发更大的图就取消 `wrangler.toml` 里 `[[r2_buckets]]` 的注释并建一个 R2 桶。
-- **客服账号**：目前是「共享口令 + 自定义名称」，多客服可同时登录，消息按各自名称署名。
-- **数据**：都在你的 D1 里，可在控制台用 SQL 直接查。
-
-## 已验证
-
-本地用 node:sqlite 模拟 D1 + Chromium 跑了完整回归：55 项接口断言（建会话、欢迎语、登录首设口令、错误口令、未读计数、已读回写、增量同步、撤回权限与超时、单侧删除、图片上传读回、备注、改名、设置、越权拦截、超长/空消息）与 37 项浏览器交互用例（文字/表情/图片发送、双端 2 秒内同步、已读回执、撤回提示、删除单侧生效、备注、设置保存、手机端布局、刷新保持登录）全部通过。
+- **实时性**：轮询方案，访客可见时秒级同步；按 Workers 免费额度可满足中小店铺常开接待。
+- **图片存储**：未配置 R2 时存 D1（前端压到 400KB 内）；更大图片可取消 `wrangler.toml` 里 `[[r2_buckets]]` 的注释并建 R2 桶。
+- **视频通话**：免费 Workers 无法承载 WebRTC，「视频 / 语音」是外部会议链接入口，不是平台内面对面视频通话。
+- **数据**：全部存在你自己的 D1 里，可在 Cloudflare 控制台直接查询。
 
 ## 版本与更新日志
 
-- 当前版本：**v3.3（2026-11-21）**
-- 完整版本记录见仓库根目录 [`CHANGELOG.md`](../CHANGELOG.md)
-- 升级步骤见 [`升级说明.md`](../升级说明.md)
-- 判断线上版本：`GET /api/health`，看 `version` 是否为 `v3.3-2026-11-21`
+- 当前版本：**v3.4（2026-11-23）**
+- 完整版本记录见 [CHANGELOG.md](CHANGELOG.md)
+- 旧版升级见 [升级说明.md](升级说明.md)
+- 判断线上版本：访问 `/api/health`，查看 `version` 字段
+
+## 赞助与支持
+
+本项目由个人独立开发与维护，代码、文档与部署教程全部免费开放，**无功能限制、无使用期限，也不存在付费版本**。
+
+如果这套系统为您的店铺经营或日常工作带来了实际帮助，欢迎通过下方二维码自愿赞赏，用以覆盖服务器、数据库等成本，并支持作者持续维护、开发新功能与完善文档。金额不限，完全自愿，且不影响您使用本项目的任何权利。
+
+<table>
+  <tr>
+    <td align="center" width="230">
+      <img src="docs/reward/wechat.png" width="190" alt="微信赞赏码"><br>
+      <sub>微信赞赏</sub>
+    </td>
+    <td align="center" width="230">
+      <img src="docs/reward/alipay.png" width="190" alt="支付宝收款码"><br>
+      <sub>支付宝赞赏</sub>
+    </td>
+  </tr>
+</table>
+
+**几点说明**
+
+- 赞赏完全自愿，不构成购买服务、购买授权或投资，不产生任何服务义务；
+- 不提供发票，不承诺定制开发、功能排期或优先技术支持；
+- 项目按现有节奏维护，赞赏与否不影响使用与问题反馈；
+- 如需商业授权、定制开发或长期技术支持，请另行沟通约定。
+
+感谢您的信任与支持，祝您客源广进、生意兴隆。
+
+<sub>English: This project is developed and maintained independently and released free of charge, with no feature limits and no paid tier. If it is useful to you, a voluntary contribution is welcome and helps cover hosting and maintenance costs. A contribution is not a purchase of services or a license and creates no service obligation; no invoices, custom development or priority support are provided.</sub>
