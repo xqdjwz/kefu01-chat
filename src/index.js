@@ -634,19 +634,29 @@ export default {
       // ---------- 登录 / 登出 / 我 ----------
       if (path === '/api/login' && method === 'POST') {
         const body = await readBody(request);
-        const password = String(body.password || '');
+        const password = String(body.password || body.passcode || '').trim();
         if (!password) return json({ error: '请输入口令' }, 400);
         const s = await getSettings(env);
+        const h = await sha256(password);
+
+        // 兼容旧版 v3.3：旧口令哈希存在 passcode_hash，登录成功后迁移到 admin_token
+        if (s.passcode_hash && !s.admin_token) {
+          if (h !== s.passcode_hash) return json({ error: '口令错误' }, 401);
+          await env.DB.prepare('UPDATE settings SET value=? WHERE key=?').bind(h, 'admin_token').run();
+          const oldName = (await env.DB.prepare('SELECT name FROM agents LIMIT 1').first())?.name || body.name || '管理员';
+          await env.DB.prepare('INSERT OR IGNORE INTO agents (token, name, created_at) VALUES (?,?,?)')
+            .bind(h, oldName, now()).run();
+          return json({ ok: true, token: password, name: oldName });
+        }
+
         const agentCount = (await env.DB.prepare('SELECT COUNT(*) AS n FROM agents').first()).n;
         if (!s.admin_token && agentCount === 0) {
           // 首次登录：把本次口令设为系统口令
-          const h = await sha256(password);
           await env.DB.prepare('UPDATE settings SET value=? WHERE key=?').bind(h, 'admin_token').run();
           await env.DB.prepare('INSERT OR IGNORE INTO agents (token, name, created_at) VALUES (?,?,?)')
             .bind(h, body.name || '管理员', now()).run();
           return json({ ok: true, token: password, firstLogin: true, name: body.name || '管理员' });
         }
-        const h = await sha256(password);
         if (s.admin_token && h === s.admin_token) {
           const name = (await env.DB.prepare('SELECT name FROM agents WHERE token=? LIMIT 1').bind(h).first())?.name || '管理员';
           return json({ ok: true, token: password, name });
