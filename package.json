@@ -1,6 +1,6 @@
 {
   "name": "cf-kefu-chat",
-  "version": "1.0.0",
+  "version": "3.4.0",
   "private": true,
   "description": "在线客服聊天系统 · Cloudflare Workers + D1 + R2",
   "scripts": {

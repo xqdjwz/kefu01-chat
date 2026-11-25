@@ -80,6 +80,11 @@ const baseSettings = (env) => ({
   welcome_enabled: '1',
   welcome_text: (env && env.WELCOME_MESSAGE) || '您好！欢迎光临，请问有什么可以帮您？',
   welcome_from: (env && env.AGENT_NAME) || '客服',
+  closing_enabled: '1',
+  closing_text: '本次服务已结束，感谢您的咨询，祝您生活愉快！如果还有问题，随时在这里留言，我们看到会尽快回复您😊',
+  closing_auto_minutes: '0',
+  merge_same_ip: '1',
+  merge_window_hours: '24',
   passcode_hash: '',
   auto_clean_days: '0',
   last_clean_at: '0',
@@ -190,11 +195,22 @@ const TABLES = [
      data TEXT,
      created_at INTEGER NOT NULL
    )`,
+  // 访客 token → 会话 的映射：同一个会话可以被多个 token（多浏览器 / 清过缓存）认领
+  `CREATE TABLE IF NOT EXISTS visitor_links (
+     token TEXT PRIMARY KEY,
+     conv_id TEXT NOT NULL,
+     created_at INTEGER NOT NULL,
+     last_seen_at INTEGER NOT NULL DEFAULT 0
+   )`,
   'CREATE INDEX IF NOT EXISTS idx_conv_last ON conversations(last_message_at DESC)',
   'CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conv_id, id)',
   'CREATE INDEX IF NOT EXISTS idx_msg_upd ON messages(conv_id, updated_at)',
   'CREATE INDEX IF NOT EXISTS idx_msg_unread ON messages(conv_id, sender, read_at)',
+  'CREATE INDEX IF NOT EXISTS idx_link_conv ON visitor_links(conv_id)',
 ];
+
+// 依赖 ALTER 补出来的列，必须等补列之后再建
+const LATE_INDEXES = ['CREATE INDEX IF NOT EXISTS idx_conv_ip ON conversations(geo_ip)'];
 
 // 老版本升级过来的库可能缺列，逐条补，已经存在就跳过
 const ALTERS = [
@@ -207,6 +223,8 @@ const ALTERS = [
   'ALTER TABLE conversations ADD COLUMN contact TEXT',
   'ALTER TABLE conversations ADD COLUMN geo_device TEXT',
   'ALTER TABLE conversations ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0',
+  'ALTER TABLE conversations ADD COLUMN ended_at INTEGER',
+  'ALTER TABLE conversations ADD COLUMN ended_by TEXT',
   'ALTER TABLE messages ADD COLUMN auto_reply INTEGER NOT NULL DEFAULT 0',
 ];
 
@@ -230,6 +248,13 @@ async function ensureSchema(env) {
       /* 列已存在 */
     }
   }
+  for (const sql of LATE_INDEXES) {
+    try {
+      await db.prepare(sql).run();
+    } catch (e) {
+      console.warn('late index:', String(e && e.message));
+    }
+  }
   for (const [key, value] of Object.entries(baseSettings(env))) {
     try {
       await db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').bind(key, value).run();
@@ -240,10 +265,19 @@ async function ensureSchema(env) {
   schemaReady = true;
 }
 
+// 设置很短时间内的缓存：访客端 2 秒一次轮询，没必要每次轮询都读一遍设置
+let settingsCache = null;
+let settingsCacheAt = 0;
+const SETTINGS_TTL = 10 * 1000;
+
 async function getSettings(env) {
+  const t = now();
+  if (settingsCache && t - settingsCacheAt < SETTINGS_TTL) return settingsCache;
   const { results } = await env.DB.prepare('SELECT key, value FROM settings').all();
   const out = { ...baseSettings(env) };
   for (const row of results || []) out[row.key] = row.value;
+  settingsCache = out;
+  settingsCacheAt = t;
   return out;
 }
 
@@ -255,6 +289,8 @@ async function setSettings(env, patch) {
       .bind(key, String(value))
       .run();
   }
+  settingsCache = null;
+  settingsCacheAt = 0;
 }
 
 /* --------------------------------- 入口 --------------------------------- */
@@ -331,6 +367,25 @@ async function identify(request, env) {
         remark: conv.remark || '',
       };
     }
+
+    // 当前浏览器不是创建会话时用的那个 token（换了浏览器 / 清过缓存），走映射表找回原会话
+    const link = await env.DB.prepare('SELECT conv_id FROM visitor_links WHERE token = ?').bind(vt).first();
+    if (link) {
+      const conv2 = await env.DB.prepare(
+        'SELECT id, visitor_name, remark FROM conversations WHERE id = ?'
+      )
+        .bind(link.conv_id)
+        .first();
+      if (conv2) {
+        return {
+          role: 'visitor',
+          token: vt,
+          convId: conv2.id,
+          name: conv2.visitor_name || '访客',
+          remark: conv2.remark || '',
+        };
+      }
+    }
   }
   return null;
 }
@@ -353,8 +408,8 @@ async function handleApi(request, env, url, ctx) {
     return json({
       ok: true,
       ts: now(),
-      version: 'v3.3-2026-11-21',
-      features: ['avatar', 'geo', 'autoReply', 'sound', 'customSound', 'contact', 'pushMulti', 'export', 'embed'],
+      version: 'v3.4-2026-11-25',
+      features: ['avatar', 'geo', 'autoReply', 'sound', 'customSound', 'contact', 'pushMulti', 'export', 'embed', 'closing', 'mergeIp'],
       storage: env.BUCKET ? 'r2+d1' : 'd1',
     });
   }
@@ -392,6 +447,16 @@ async function handleApi(request, env, url, ctx) {
 
   const remarkMatch = path.match(/^\/api\/conversations\/([a-zA-Z0-9_-]+)\/remark$/);
   if (remarkMatch && method === 'POST') return handleRemark(request, env, remarkMatch[1]);
+
+  const endMatch = path.match(/^\/api\/conversations\/([a-zA-Z0-9_-]+)\/end$/);
+  if (endMatch && method === 'POST') return handleEndConversation(request, env, endMatch[1]);
+
+  const reopenMatch = path.match(/^\/api\/conversations\/([a-zA-Z0-9_-]+)\/reopen$/);
+  if (reopenMatch && method === 'POST') return handleReopenConversation(request, env, reopenMatch[1]);
+
+  if (path === '/api/conversations/merge-duplicates' && method === 'POST') {
+    return handleMergeDuplicates(request, env);
+  }
 
   // 兼容旧接口名
   const delMatch = path.match(/^\/api\/conversations\/([a-zA-Z0-9_-]+)$/);
@@ -494,6 +559,11 @@ async function handleGetSettings(request, env) {
   return json({
     ...publicSettings(s),
     agentName: ident.name,
+    closingEnabled: s.closing_enabled === '1',
+    closingText: s.closing_text || '',
+    closingAutoMinutes: Number(s.closing_auto_minutes) || 0,
+    mergeSameIp: s.merge_same_ip === '1',
+    mergeWindowHours: Number(s.merge_window_hours) || 0,
     passcodeSet: !!s.passcode_hash,
     recallWindow: Number(env.RECALL_WINDOW_SEC || 120),
     imageStorage: env.BUCKET ? 'R2 + D1' : 'D1',
@@ -533,8 +603,20 @@ async function handleSaveSettings(request, env) {
     const v = String(body.welcomeFrom).trim().slice(0, 16);
     patch.welcome_from = v || '客服';
   }
-  if (body.newPasscode !== undefined && String(body.newPasscode).trim()) {
-    const v = String(body.newPasscode).trim();
+  if (body.closingEnabled !== undefined) patch.closing_enabled = body.closingEnabled ? '1' : '0';
+  if (body.closingText !== undefined) patch.closing_text = String(body.closingText).slice(0, 500);
+  if (body.closingAutoMinutes !== undefined) {
+    const n = Math.floor(Number(body.closingAutoMinutes));
+    if (!Number.isFinite(n) || n < 0 || n > 1440) return fail('自动结束分钟数需在 0～1440 之间', 400, 'bad_range');
+    patch.closing_auto_minutes = String(n);
+  }
+  if (body.mergeSameIp !== undefined) patch.merge_same_ip = body.mergeSameIp ? '1' : '0';
+  if (body.mergeWindowHours !== undefined) {
+    const n = Math.floor(Number(body.mergeWindowHours));
+    if (!Number.isFinite(n) || n < 0 || n > 720) return fail('同 IP 合并时间窗口需在 0～720 小时之间', 400, 'bad_range');
+    patch.merge_window_hours = String(n);
+  }
+  if (body.newPasscode !== undefined && String(body.newPasscode).trim()) {    const v = String(body.newPasscode).trim();
     if (v.length < 4) return fail('新口令至少 4 位', 400, 'weak_passcode');
     patch.passcode_hash = await sha256(v);
   }
@@ -629,6 +711,11 @@ async function handleSaveSettings(request, env) {
     ok: true,
     ...publicSettings(s),
     agentName: ident.name,
+    closingEnabled: s.closing_enabled === '1',
+    closingText: s.closing_text || '',
+    closingAutoMinutes: Number(s.closing_auto_minutes) || 0,
+    mergeSameIp: s.merge_same_ip === '1',
+    mergeWindowHours: Number(s.merge_window_hours) || 0,
     autoCleanDays: Number(s.auto_clean_days) || 0,
     agentOnline: s.agent_online === '1',
     autoReplyEnabled: s.auto_reply_enabled === '1',
@@ -731,6 +818,10 @@ async function runCleanup(env, days) {
   )
     .bind(cutoff)
     .run();
+  // 会话被清掉了，对应的 token 映射也一起清掉
+  await env.DB.prepare(
+    'DELETE FROM visitor_links WHERE conv_id NOT IN (SELECT id FROM conversations)'
+  ).run();
   return {
     days,
     cutoff,
@@ -811,6 +902,8 @@ const mapConv = (row) => {
     referer: row.geo_referer || '',
     device: row.geo_device || '',
     blocked: !!row.blocked,
+    endedAt: row.ended_at || 0,
+    endedBy: row.ended_by || '',
     lastVisitorAt: row.last_visitor_at || 0,
     contact: parseContact(row.contact),
   };
@@ -876,6 +969,83 @@ function geoOf(request, body) {
 }
 
 
+/* 访客入站：同一个 IP 默认复用已有会话，不再新起一条 */
+
+async function touchConv(env, conv, geo, name) {
+  const t = now();
+  const patch = { visitor_seen_at: t };
+  if (name && name !== conv.visitor_name) patch.visitor_name = name;
+  if (!conv.geo_ip && geo.ip) patch.geo_ip = geo.ip;
+  if (!conv.geo_location && geo.location) patch.geo_location = geo.location;
+  const keepReferer = conv.geo_referer && !conv.geo_referer.includes('localhost');
+  if (!keepReferer && geo.referer) patch.geo_referer = geo.referer;
+  if (!conv.geo_device && geo.device) patch.geo_device = geo.device;
+  const sets = Object.keys(patch)
+    .map((k) => `${k} = ?`)
+    .join(', ');
+  await env.DB.prepare(`UPDATE conversations SET ${sets} WHERE id = ?`)
+    .bind(...Object.values(patch), conv.id)
+    .run();
+  Object.assign(conv, patch);
+}
+
+async function linkToken(env, token, convId) {
+  if (!token || !convId) return;
+  await env.DB.prepare(
+    `INSERT INTO visitor_links (token, conv_id, created_at, last_seen_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(token) DO UPDATE SET conv_id = excluded.conv_id, last_seen_at = excluded.last_seen_at`
+  )
+    .bind(token, convId, now(), now())
+    .run();
+}
+
+// 找同一 IP、时间窗口内最近活跃的一条会话
+async function findReusableConv(env, geo, s) {
+  if (!geo.ip) return null;
+  const hours = Math.max(0, Number(s.merge_window_hours) || 0);
+  const cutoff = hours > 0 ? now() - hours * 3600 * 1000 : 0;
+
+  const sql = `SELECT * FROM conversations
+               WHERE geo_ip = ? AND (blocked IS NULL OR blocked = 0)
+               ORDER BY COALESCE(last_message_at, created_at) DESC LIMIT 3`;
+  let rows = [];
+  try {
+    rows = ((await env.DB.prepare(sql).bind(geo.ip).all()).results) || [];
+  } catch (e) {
+    console.warn('findReusableConv:', String(e && e.message));
+    return null;
+  }
+  for (const c of rows) {
+    const lastAt = c.last_message_at || c.created_at || 0;
+    if (cutoff && lastAt < cutoff) continue;
+    return c;
+  }
+  return null;
+}
+
+function sessionPayload(conv, token, s, shop) {
+  return {
+    token,
+    conv: {
+      id: conv.id,
+      name: conv.visitor_name || '访客',
+      visitorName: conv.visitor_name || '访客',
+      remark: '',
+      preview: conv.last_preview || '',
+      lastMessageAt: conv.last_message_at || conv.created_at,
+      createdAt: conv.created_at,
+      unread: 0,
+      device: conv.geo_device || '',
+      blocked: !!conv.blocked,
+      endedAt: conv.ended_at || 0,
+    },
+    blocked: !!conv.blocked,
+    shop,
+    welcome: { enabled: s.welcome_enabled === '1', text: s.welcome_text },
+    contactEnabled: s.contact_enabled === '1',
+  };
+}
+
 async function handleSession(request, env) {
   const body = await safeBody(request);
   const token = typeof body.token === 'string' ? body.token.trim() : '';
@@ -885,51 +1055,30 @@ async function handleSession(request, env) {
   const shop = s.shop_name || '在线客服';
   const geo = geoOf(request, body);
 
+  let conv = null;
   if (token) {
-    const conv = await env.DB.prepare('SELECT * FROM conversations WHERE visitor_token = ?').bind(token).first();
-    if (conv) {
-      const t = now();
-      if (name && name !== conv.visitor_name) {
-        await env.DB.prepare('UPDATE conversations SET visitor_name = ?, updated_at = ? WHERE id = ?')
-          .bind(name, t, conv.id)
-          .run();
-        conv.visitor_name = name;
-      }
-      const patch = { visitor_seen_at: t };
-      if (!conv.geo_ip && geo.ip) patch.geo_ip = geo.ip;
-      if (!conv.geo_location && geo.location) patch.geo_location = geo.location;
-      const keepReferer = conv.geo_referer && !conv.geo_referer.includes('localhost');
-      if (!keepReferer && geo.referer) patch.geo_referer = geo.referer;
-      if (!conv.geo_device && geo.device) patch.geo_device = geo.device;
-      const sets = Object.keys(patch)
-        .map((k) => `${k} = ?`)
-        .join(', ');
-      await env.DB.prepare(`UPDATE conversations SET ${sets} WHERE id = ?`)
-        .bind(...Object.values(patch), conv.id)
-        .run();
-      return json({
-        token,
-        conv: {
-          id: conv.id,
-          name: conv.visitor_name || '访客',
-          visitorName: conv.visitor_name || '访客',
-          remark: '',
-          preview: conv.last_preview || '',
-          lastMessageAt: conv.last_message_at || conv.created_at,
-          createdAt: conv.created_at,
-          unread: 0,
-          device: conv.geo_device || geo.device || '',
-          blocked: !!conv.blocked,
-        },
-        blocked: !!conv.blocked,
-        shop,
-        welcome: { enabled: s.welcome_enabled === '1', text: s.welcome_text },
-        contactEnabled: s.contact_enabled === '1',
-      });
+    conv = await env.DB.prepare('SELECT * FROM conversations WHERE visitor_token = ?').bind(token).first();
+    if (!conv) {
+      const link = await env.DB.prepare('SELECT conv_id FROM visitor_links WHERE token = ?').bind(token).first();
+      if (link) conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(link.conv_id).first();
     }
+  }
+  if (conv) {
+    await touchConv(env, conv, geo, name);
+    await linkToken(env, token, conv.id);
+    return json(sessionPayload(conv, token, s, shop));
   }
 
   const newToken = token || uid(40);
+
+  // 没有匹配的 token 时：同一 IP 已有会话就直接并进去，不新建
+  const reused = s.merge_same_ip === '1' ? await findReusableConv(env, geo, s) : null;
+  if (reused) {
+    await touchConv(env, reused, geo, name);
+    await linkToken(env, newToken, reused.id);
+    return json(sessionPayload(reused, newToken, s, shop));
+  }
+
   const id = uid(16);
   const t = now();
   const visitorName = name || '访客';
@@ -939,6 +1088,8 @@ async function handleSession(request, env) {
   )
     .bind(id, newToken, visitorName, t, t, t, geo.ip || null, geo.location || null, geo.referer || null, geo.device || null)
     .run();
+
+  await linkToken(env, newToken, id);
 
   // 自动欢迎语：只在新会话时发一条
   let preview = '';
@@ -963,7 +1114,7 @@ async function handleSession(request, env) {
 
   return json({
     token: newToken,
-    conv: { id, name: visitorName, visitorName, remark: '', preview, lastMessageAt: t, createdAt: t, unread: 0, device: geo.device || '', blocked: false },
+    conv: { id, name: visitorName, visitorName, remark: '', preview, lastMessageAt: t, createdAt: t, unread: 0, device: geo.device || '', blocked: false, endedAt: 0 },
     blocked: false,
     shop,
     welcome: { enabled: s.welcome_enabled === '1', text: s.welcome_text },
@@ -999,7 +1150,6 @@ async function handleDeleteConversation(request, env, convId) {
 
   // 双重确认：前端会传 confirm:true，缺了就不删，防手滑
   if (!body.confirm) return fail('需要二次确认才能删除会话', 400, 'need_confirm');
-
   const filesRes = await env.DB.prepare(
     "SELECT file_key FROM messages WHERE conv_id = ? AND file_key IS NOT NULL AND file_key <> ''"
   )
@@ -1010,6 +1160,7 @@ async function handleDeleteConversation(request, env, convId) {
 
   const msgs = await env.DB.prepare('DELETE FROM messages WHERE conv_id = ?').bind(convId).run();
   const convRes = await env.DB.prepare('DELETE FROM conversations WHERE id = ?').bind(convId).run();
+  await env.DB.prepare('DELETE FROM visitor_links WHERE conv_id = ?').bind(convId).run();
   pushCooldown.delete(convId);
 
   return json({
@@ -1019,6 +1170,185 @@ async function handleDeleteConversation(request, env, convId) {
     files: keys.length,
     conversations: (convRes.meta && convRes.meta.changes) || 0,
   });
+}
+
+/* ------------------------------- 结束语 / 结束会话 ------------------------------- */
+
+/**
+ * 给会话发一条结束语并标记为已结束。
+ * @returns {Promise<{message: object|null, endedAt: number}>}
+ */
+async function endConversation(env, convId, opts = {}) {
+  const s = opts.settings || (await getSettings(env));
+  const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
+  if (!conv) return { message: null, endedAt: 0 };
+
+  const t = now();
+  const text = String(opts.text !== undefined ? opts.text : s.closing_text || '')
+    .trim()
+    .slice(0, 500);
+  const sender = (opts.sender || s.welcome_from || '客服').slice(0, 16);
+  let message = null;
+
+  // 已经结束过就不再重复发结束语
+  if (!conv.ended_at && opts.force !== false && s.closing_enabled === '1' && text) {
+    try {
+      const ins = await env.DB.prepare(
+        `INSERT INTO messages (conv_id, sender, sender_name, type, body, created_at, updated_at)
+         VALUES (?, 'agent', ?, 'text', ?, ?, ?)`
+      )
+        .bind(convId, sender, text, t, t)
+        .run();
+      const rid = Number(ins.meta && ins.meta.last_row_id) || 0;
+      const row = await env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(rid).first();
+      message = row ? mapMessage(row) : null;
+      await env.DB.prepare(
+        'UPDATE conversations SET last_message_at = ?, last_preview = ?, updated_at = ? WHERE id = ?'
+      )
+        .bind(t, `客服: ${text.slice(0, 40)}`, t, convId)
+        .run();
+    } catch (e) {
+      console.error('closing message failed', e);
+    }
+  }
+
+  await env.DB.prepare('UPDATE conversations SET ended_at = ?, ended_by = ?, updated_at = ? WHERE id = ?')
+    .bind(t, (opts.byName || sender).slice(0, 16), t, convId)
+    .run();
+
+  return { message, endedAt: t };
+}
+
+// 访客长时间没发消息时，轮询里懒触发一次自动结束（默认关闭，0 = 不发）
+async function maybeAutoEnd(env, conv) {
+  try {
+    if (!conv || conv.ended_at || conv.blocked) return null;
+    const s = await getSettings(env);
+    if (s.closing_enabled !== '1') return null;
+    const mins = Number(s.closing_auto_minutes) || 0;
+    if (mins <= 0) return null;
+    if (now() - (conv.last_message_at || conv.created_at) < mins * 60 * 1000) return null;
+
+    // 访客一句话都没说过就别发，避免刚打开页面就收到结束语
+    const v = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM messages WHERE conv_id = ? AND sender = 'visitor' AND status = 'active'"
+    )
+      .bind(conv.id)
+      .first();
+    if (!(v && v.n)) return null;
+
+    await endConversation(env, conv.id, { settings: s, byName: '自动结束' });
+    return true;
+  } catch (e) {
+    console.warn('auto end:', String(e && e.message));
+    return null;
+  }
+}
+
+async function handleEndConversation(request, env, convId) {
+  const ident = await identify(request, env);
+  if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
+
+  const body = await safeBody(request);
+  const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
+  if (!conv) return fail('会话不存在', 404, 'not_found');
+
+  const r = await endConversation(env, convId, {
+    text: typeof body.text === 'string' && body.text.trim() ? body.text : undefined,
+    byName: ident.name,
+  });
+  pushCooldown.delete(convId);
+  return json({ ok: true, endedAt: r.endedAt, message: r.message });
+}
+
+async function handleReopenConversation(request, env, convId) {
+  const ident = await identify(request, env);
+  if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
+  const conv = await env.DB.prepare('SELECT id FROM conversations WHERE id = ?').bind(convId).first();
+  if (!conv) return fail('会话不存在', 404, 'not_found');
+  await env.DB.prepare('UPDATE conversations SET ended_at = NULL, ended_by = NULL, updated_at = ? WHERE id = ?')
+    .bind(now(), convId)
+    .run();
+  return json({ ok: true, endedAt: 0 });
+}
+
+/* ------------------------- 合并同 IP 的历史重复会话 ------------------------- */
+
+async function handleMergeDuplicates(request, env) {
+  const ident = await identify(request, env);
+  if (!ident || ident.role !== 'agent') return fail('未登录', 401, 'unauthorized');
+
+  const body = await safeBody(request);
+  if (body.confirm !== true) return fail('请先确认再合并', 400, 'confirm_required');
+
+  // 按 IP 分组，把同一出口 IP 的重复会话并成一条（和"同 IP 不再新建会话"保持一致）
+  const { results } = await env.DB.prepare(
+    `SELECT geo_ip, COUNT(*) AS n
+     FROM conversations
+     WHERE geo_ip IS NOT NULL AND geo_ip <> ''
+     GROUP BY geo_ip
+     HAVING COUNT(*) > 1
+     ORDER BY n DESC
+     LIMIT 200`
+  ).all();
+
+  const s = await getSettings(env);
+  const welcomeText = (s.welcome_text || '').trim();
+
+  let groups = 0;
+  let removed = 0;
+
+  for (const g of results || []) {
+    // 以最早创建的那条为主会话，其它并进来（聊天记录最多、身份最"原始"）
+    const rows = (
+      await env.DB.prepare(
+        `SELECT * FROM conversations
+         WHERE geo_ip = ?
+         ORDER BY created_at ASC`
+      )
+        .bind(g.geo_ip)
+        .all()
+    ).results || [];
+    if (rows.length < 2) continue;
+
+    const keep = rows[0];
+    for (const c of rows.slice(1)) {
+      await env.DB.prepare('UPDATE messages SET conv_id = ? WHERE conv_id = ?').bind(keep.id, c.id).run();
+      await env.DB.prepare('UPDATE visitor_links SET conv_id = ? WHERE conv_id = ?').bind(keep.id, c.id).run();
+      // 被并掉那条的原始 token 也指过来，避免那边浏览器直接掉会话
+      await linkToken(env, c.visitor_token, keep.id);
+      await env.DB.prepare('DELETE FROM conversations WHERE id = ?').bind(c.id).run();
+      removed += 1;
+    }
+
+    // 合并后重算最后一条消息的预览（跳过重复会话里那句自动欢迎语）
+    const last = await env.DB.prepare(
+      `SELECT * FROM messages WHERE conv_id = ? AND status = 'active'
+         AND NOT (sender = 'agent' AND ? <> '' AND TRIM(COALESCE(body, '')) = ?)
+       ORDER BY created_at DESC, id DESC LIMIT 1`
+    )
+      .bind(keep.id, welcomeText, welcomeText)
+      .first();
+    const lastAny =
+      last ||
+      (await env.DB.prepare(
+        `SELECT * FROM messages WHERE conv_id = ? AND status = 'active'
+         ORDER BY created_at DESC, id DESC LIMIT 1`
+      )
+        .bind(keep.id)
+        .first());
+    if (lastAny) {
+      const preview = lastAny.type === 'image' ? '[图片]' : (lastAny.body || '').slice(0, 40);
+      await env.DB.prepare(
+        'UPDATE conversations SET last_message_at = ?, last_preview = ?, updated_at = ? WHERE id = ?'
+      )
+        .bind(lastAny.created_at, `${lastAny.sender === 'agent' ? '客服: ' : ''}${preview}`, now(), keep.id)
+        .run();
+    }
+    groups += 1;
+  }
+
+  return json({ ok: true, groups, conversations: removed });
 }
 
 async function handleBlock(request, env, convId) {
@@ -1082,8 +1412,13 @@ async function handleListMessages(request, env, url) {
   if (!convId) return fail('缺少会话标识', 400, 'missing_conv');
   if (ident.role === 'visitor' && convId !== ident.convId) return fail('无权访问该会话', 403, 'forbidden');
 
-  const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
+  let conv = await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first();
   if (!conv) return fail('会话不存在', 404, 'not_found');
+
+  // 长时间没人说话且开启了自动结束：借访客轮询懒触发一次（每会话只触发一次）
+  if (ident.role === 'visitor' && (await maybeAutoEnd(env, conv))) {
+    conv = (await env.DB.prepare('SELECT * FROM conversations WHERE id = ?').bind(convId).first()) || conv;
+  }
 
   const after = Number(url.searchParams.get('after') || 0) || 0;
   const since = Number(url.searchParams.get('since') || 0) || 0;
@@ -1134,6 +1469,8 @@ async function handleListMessages(request, env, url) {
       remark: conv.remark || '',
       unread: (unreadRow && unreadRow.n) || 0,
       lastReadAt: ident.role === 'visitor' ? conv.visitor_last_read_at : conv.agent_last_read_at,
+      endedAt: conv.ended_at || 0,
+      blocked: !!conv.blocked,
     },
     now: now(),
   });
@@ -1408,6 +1745,13 @@ async function handleSendMessage(request, env, url, ctx) {
   if (!conv) return fail('会话不存在', 404, 'not_found');
   if (ident.role === 'visitor' && conv.blocked) {
     return fail('本次对话已被客服关闭，暂时无法发送消息', 403, 'blocked');
+  }
+
+  // 会话结束后又有人说话：自动视为重新开始（不清空聊天记录，只是去掉"已结束"标记）
+  if (conv.ended_at) {
+    await env.DB.prepare('UPDATE conversations SET ended_at = NULL, ended_by = NULL WHERE id = ?')
+      .bind(convId)
+      .run();
   }
 
   const type = body.type === 'image' ? 'image' : 'text';
