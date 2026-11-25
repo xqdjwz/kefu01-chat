@@ -314,7 +314,7 @@ bucket_name = "cf-kefu-files"
 
 ## 📄 License
 
-[Apache-2.0](./LICENSE) © 你的名字
+[Apache-2.0](./LICENSE) © xqdjwz
 
 - 允许商用、修改、闭源分发，并可获得贡献者的明确**专利授权**；不授予商标使用权。
 - 分发时请随附 `LICENSE` 与 `NOTICE`（二进制/安装包同理，别只把许可塞在压缩包里）。
