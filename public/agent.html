@@ -74,6 +74,7 @@
           <div class="pane-sub" id="pane-sub">从左侧选择一个访客会话</div>
         </div>
         <button class="text-link pane-export" id="btn-export" type="button" title="导出该会话聊天记录" hidden>导出</button>
+        <button class="text-link pane-end" id="btn-end" type="button" title="给访客发送结束语并结束本次对话" hidden>结束对话</button>
         <button class="text-link pane-block" id="btn-block" type="button" title="拉黑该访客，对方将无法发消息" hidden>拉黑</button>
         <button class="text-link pane-delete" id="btn-conv-delete" type="button" title="永久删除该会话（含全部消息和图片）" hidden>删除会话</button>
         <button class="rename-btn" id="btn-remark" type="button" title="备注该顾客" aria-label="备注该顾客" hidden>
@@ -154,6 +155,26 @@
 
         <label class="field-label" for="set-welcome-from">欢迎语署名</label>
         <input class="field-input" id="set-welcome-from" maxlength="16" placeholder="客服">
+
+        <div class="switch-row" style="margin-top:16px">
+          <div>
+            <div class="switch-title">对话结束语</div>
+            <div class="switch-desc">点右上角「结束对话」时，自动给访客发一条收尾消息</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="set-closing-enabled">
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+          </label>
+        </div>
+
+        <label class="field-label" for="set-closing-text">结束语内容</label>
+        <textarea class="field-input field-textarea" id="set-closing-text" rows="3" maxlength="500" placeholder="本次服务已结束，感谢您的咨询，祝您生活愉快！"></textarea>
+
+        <label class="field-label" for="set-closing-auto" style="margin-top:12px">访客长时间没发言自动结束（分钟，0 = 关闭）</label>
+        <div class="usage-row">
+          <input class="field-input" id="set-closing-auto" type="number" min="0" max="1440" step="1" value="0">
+        </div>
+        <div class="avatar-hint" style="margin:2px 0 4px">访客至少发过一条消息后，超过设定时间没有新消息，就自动发结束语并标记结束；访客再发消息会自动重新开始。</div>
 
         <label class="field-label" for="set-passcode" style="margin-top:14px">修改口令（留空表示不改）</label>
         <input class="field-input" id="set-passcode" type="password" placeholder="至少 4 位" autocomplete="new-password">
@@ -264,6 +285,30 @@
           <input class="field-input" id="set-bark" maxlength="300" placeholder="https://api.day.app/你的Key">
 
           <div class="usage-note">同一个会话 5 秒内最多推一条，避免刷屏。推送失败不影响聊天。钉钉/企业微信机器人记得在群里把"自定义关键词"或"加签"设置成不限制，否则会拒收。</div>
+        </div>
+
+        <div class="kw-block">
+          <div class="usage-head"><span>会话合并（同一 IP 不重复建会话）</span></div>
+          <div class="kw-tip">同一个访客（同一 IP）再次进入时，默认接着原来的会话聊，不再新起一条。</div>
+          <div class="switch-row kw-switch">
+            <div>
+              <div class="switch-title">同一 IP 复用会话</div>
+              <div class="switch-desc">关闭后：清缓存 / 换浏览器就会新开一条会话</div>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="set-merge-ip">
+              <span class="switch-track"><span class="switch-thumb"></span></span>
+            </label>
+          </div>
+          <label class="field-label" for="set-merge-window" style="margin-top:12px">合并时间窗口（小时，0 = 不限）</label>
+          <div class="usage-row">
+            <input class="field-input" id="set-merge-window" type="number" min="0" max="720" step="1" value="24">
+          </div>
+          <div class="usage-note">同一 WiFi / 公司网络下的不同顾客可能共用一个出口 IP，所以默认按 IP 认人，并且只合并时间窗口内的会话。已经有重复会话，可以点下面按钮一次性合并（会保留全部聊天记录）。</div>
+          <div class="usage-row">
+            <span style="flex:1"></span>
+            <button class="btn-ghost" id="merge-duplicates" type="button">合并历史重复会话</button>
+          </div>
         </div>
 
         <div class="usage-block">
@@ -549,6 +594,8 @@ async function loadConversations() {
         if (cur) {
           paneName.textContent = cur.name;
           paneSub.textContent = cur.preview ? `最近：${cur.preview}` : '暂无消息';
+          updateEndBtn(cur);
+          renderGeo(cur);
         }
       }
       renderList();
@@ -572,7 +619,10 @@ function renderList(force = false) {
 
   const sig =
     list
-      .map((c) => `${c.id}:${c.unread}:${c.lastMessageAt}:${c.preview}:${c.name}:${c.online ? 1 : 0}`)
+      .map(
+        (c) =>
+          `${c.id}:${c.unread}:${c.lastMessageAt}:${c.preview}:${c.name}:${c.online ? 1 : 0}:${c.endedAt || 0}`
+      )
       .join('|') + `#${keyword}#${activeId}`;
   if (!force && sig === lastListSig) return;
   lastListSig = sig;
@@ -623,6 +673,11 @@ function renderList(force = false) {
       tag.className = 'remark-tag is-blocked';
       tag.textContent = '已拉黑';
       name.appendChild(tag);
+    } else if (c.endedAt) {
+      const tag = document.createElement('span');
+      tag.className = 'remark-tag is-ended';
+      tag.textContent = '已结束';
+      name.appendChild(tag);
     }
 
     const geoBits = [c.ip, c.location, c.device].filter(Boolean).join(' ');
@@ -670,6 +725,7 @@ function openConversation(c) {
   remarkBtn.hidden = false;
   document.getElementById('btn-export').hidden = false;
   document.getElementById('btn-conv-delete').hidden = false;
+  document.getElementById('btn-end').hidden = false;
 
   const preview = (c.preview || '').replace(/^客服[:：]\s*/, '');
   paneName.textContent = c.name || '访客';
@@ -681,6 +737,7 @@ function openConversation(c) {
 
   renderGeo(c);
   updateBlockBtn(c);
+  updateEndBtn(c);
   appView.classList.add('mobile-open');
   renderList();
   chat.setConv(c.id);
@@ -697,6 +754,7 @@ function renderGeo(c) {
   if (c.referer) bits.push(`来源：${c.referer}`);
   if (c.device) bits.push(`设备：${c.device}`);
   if (c.blocked) bits.push('状态：已拉黑（对方发不了消息）');
+  if (c.endedAt) bits.push('状态：对话已结束（对方再发消息会自动重新开始）');
   const ct = c.contact;
   if (ct) {
     const arr = [
@@ -730,6 +788,50 @@ function updateBlockBtn(c) {
   btn.textContent = blocked ? '撤销拉黑' : '拉黑';
   btn.classList.toggle('is-off', blocked);
 }
+
+const END_BTN_DEFAULT_TITLE = '给访客发送结束语并结束本次对话';
+
+function updateEndBtn(c) {
+  const btn = document.getElementById('btn-end');
+  if (!btn) return;
+  btn.hidden = !c;
+  if (!c) return;
+  const ended = !!c.endedAt;
+  btn.textContent = ended ? '已结束' : '结束对话';
+  btn.title = ended ? '本次对话已结束，点一下可以重新开启' : END_BTN_DEFAULT_TITLE;
+  btn.classList.toggle('is-off', ended);
+}
+
+document.getElementById('btn-end').addEventListener('click', async () => {
+  if (!activeId) return toast('请先选择会话');
+  const cur = conversations.find((x) => x.id === activeId);
+  const ended = !!(cur && cur.endedAt);
+  if (ended) {
+    try {
+      await api(`/api/conversations/${encodeURIComponent(activeId)}/reopen`, { method: 'POST' });
+      toast('已重新开启本次对话');
+      await loadConversations();
+      if (chat) chat.refresh();
+    } catch (e) {
+      toast(e.message);
+    }
+    return;
+  }
+  if (!confirm('给访客发送结束语，并把本次对话标记为已结束？\n\n访客再发消息会自动重新开始，聊天记录不会丢。')) return;
+  try {
+    const r = await api(`/api/conversations/${encodeURIComponent(activeId)}/end`, { method: 'POST' });
+    toast(r.message ? '已发送结束语，本次对话结束' : '本次对话已结束（结束语未开启）');
+    if (chat) chat.refresh();
+    await loadConversations();
+    const nowCur = conversations.find((x) => x.id === activeId);
+    if (nowCur) {
+      updateEndBtn(nowCur);
+      renderGeo(nowCur);
+    }
+  } catch (e) {
+    toast(e.message);
+  }
+});
 
 document.getElementById('btn-block').addEventListener('click', async () => {
   if (!activeId) return toast('请先选择会话');
@@ -1027,6 +1129,13 @@ settingsBtn.addEventListener('click', async () => {
     document.getElementById('set-welcome-enabled').checked = !!s.welcomeEnabled;
     document.getElementById('set-welcome').value = s.welcomeText || '';
     document.getElementById('set-welcome-from').value = s.welcomeFrom || '客服';
+    document.getElementById('set-closing-enabled').checked = !!s.closingEnabled;
+    document.getElementById('set-closing-text').value = s.closingText || '';
+    document.getElementById('set-closing-auto').value = String(s.closingAutoMinutes || 0);
+    document.getElementById('set-merge-ip').checked = s.mergeSameIp !== false;
+    document.getElementById('set-merge-window').value = String(
+      Number.isFinite(s.mergeWindowHours) ? s.mergeWindowHours : 24
+    );
     document.getElementById('set-passcode').value = '';
     agentAvatarUrl = s.agentAvatarUrl || '';
     renderAvatarPreview();
@@ -1063,6 +1172,11 @@ document.getElementById('settings-save').addEventListener('click', async () => {
     welcomeEnabled: document.getElementById('set-welcome-enabled').checked,
     welcomeText: document.getElementById('set-welcome').value,
     welcomeFrom: document.getElementById('set-welcome-from').value.trim(),
+    closingEnabled: document.getElementById('set-closing-enabled').checked,
+    closingText: document.getElementById('set-closing-text').value,
+    closingAutoMinutes: Math.floor(Number(document.getElementById('set-closing-auto').value || 0)),
+    mergeSameIp: document.getElementById('set-merge-ip').checked,
+    mergeWindowHours: Math.floor(Number(document.getElementById('set-merge-window').value || 0)),
     autoCleanDays: Math.floor(Number(document.getElementById('set-clean-days').value || 0)),
     agentOnline: document.getElementById('set-online').checked,
     soundEnabled: document.getElementById('set-sound').checked,
@@ -1107,6 +1221,29 @@ document.getElementById('settings-save').addEventListener('click', async () => {
   } catch (e) {
     settingsError.textContent = e.message;
     settingsError.style.display = 'block';
+  }
+});
+
+document.getElementById('merge-duplicates').addEventListener('click', async () => {
+  if (
+    !confirm(
+      '把同一 IP 的重复会话合并成一条？\n\n所有聊天记录、图片都会保留，只是列表里重复的那几条会并入最近活跃的那条，合并后无法自动还原。'
+    )
+  )
+    return;
+  const btn = document.getElementById('merge-duplicates');
+  btn.disabled = true;
+  try {
+    const r = await api('/api/conversations/merge-duplicates', {
+      method: 'POST',
+      body: JSON.stringify({ confirm: true }),
+    });
+    toast(r.groups ? `已合并 ${r.groups} 组、清理 ${r.conversations} 条重复会话` : '没有发现重复会话');
+    await loadConversations();
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    btn.disabled = false;
   }
 });
 

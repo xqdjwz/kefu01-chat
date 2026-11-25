@@ -149,6 +149,7 @@ export function createChatHost(opts) {
   let lastId = 0;
   let since = 0;
   let lastSig = '';
+  let endedAt = 0;
   let timer = null;
   let sending = false;
   let stick = true;
@@ -423,7 +424,8 @@ export function createChatHost(opts) {
 
   function render(force = false) {
     const sig =
-      messages.map((m) => `${m.id}:${m.updatedAt}:${m.readAt}:${m.status}`).join('|') + `#${convId}`;
+      messages.map((m) => `${m.id}:${m.updatedAt}:${m.readAt}:${m.status}`).join('|') +
+      `#${convId}#e${endedAt}`;
     if (!force && sig === lastSig) return;
     lastSig = sig;
 
@@ -447,12 +449,24 @@ export function createChatHost(opts) {
       list.appendChild(messageNode(m));
     }
 
+    // 会话已结束：在最后一条（结束语）下面加一条提示；有人再发言后自动消失
+    const lastTs = messages.length ? messages[messages.length - 1].createdAt : 0;
+    if (endedAt && lastTs <= endedAt) {
+      const end = document.createElement('div');
+      end.className = 'chat-ended';
+      const title = document.createElement('span');
+      title.textContent = '本次会话已结束';
+      const tip = document.createElement('small');
+      tip.textContent = role === 'visitor' ? '直接发消息即可重新开始' : '对方再发消息会自动重新开始';
+      end.append(title, tip);
+      list.appendChild(end);
+    }
+
     if (wasStick || force) {
       toBottom();
       requestAnimationFrame(toBottom);
     }
   }
-
   function patchLocal(id, patch) {
     const idx = messages.findIndex((m) => m.id === id);
     if (idx >= 0) messages[idx] = { ...messages[idx], ...patch };
@@ -517,6 +531,14 @@ export function createChatHost(opts) {
       if (data.updates && data.updates.length) {
         changed = mergeMessages(data.updates) || changed;
         since = Math.max(since, ...data.updates.map((m) => m.updatedAt || 0));
+      }
+
+      if (data.conv) {
+        const ea = Number(data.conv.endedAt) || 0;
+        if (ea !== endedAt) {
+          endedAt = ea;
+          changed = true;
+        }
       }
 
       if (changed) {
@@ -691,6 +713,7 @@ export function createChatHost(opts) {
     messages = [];
     lastId = 0;
     since = 0;
+    endedAt = 0;
     lastSig = '';
     emojiPanel.hidden = true;
     textarea.value = '';
